@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: jetracer
+Version: 0.1.0
+Summary: Custom Lidar-enabled JetRacer for Overtaking Research
+License-File: LICENSE.md
+Requires-Dist: pyserial
+Requires-Dist: smbus
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: summary

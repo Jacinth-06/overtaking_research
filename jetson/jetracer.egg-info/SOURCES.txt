@@ -1,8 +1,9 @@
+LICENSE.md
 README.md
 setup.py
 jetracer/__init__.py
+jetracer/jetracer.py
 jetracer/nvidia_racecar.py
-jetracer/nvidia_racecar_copy.py
 jetracer/racecar.py
 jetracer.egg-info/PKG-INFO
 jetracer.egg-info/SOURCES.txt
