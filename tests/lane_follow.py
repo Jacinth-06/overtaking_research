@@ -211,7 +211,7 @@ def control_loop(car: JetRacer):
             state["lane_found"] = lane_found
 
         # Encode and publish frame
-        _, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        _, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 40])
         with frame_lock:
             latest_frame = jpeg.tobytes()
 
@@ -420,7 +420,7 @@ def generate_mjpeg():
             continue
         yield (b"--frame\r\n"
                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-        time.sleep(0.033)   # ~30 fps cap
+        time.sleep(0.1)   # ~30 fps cap
 
 
 @app.route("/video_feed")
@@ -463,4 +463,3 @@ if __name__ == "__main__":
 
 
 
-    
