@@ -6,8 +6,8 @@ car = JetRacer(init_lidar=True)
 car.arm(delay=3)
 
 # Configuration
-STOP_DISTANCE = 500.0  # Stop if object is closer than 500mm (50cm)
-DRIVE_SPEED = 0.12     # Slow crawl for testing
+STOP_DISTANCE = 800.0  # Stop if object is closer than 800mm (80cm)
+DRIVE_SPEED = 0.4     # Slow crawl for testing
 
 print(f"Safety Shield Active. Threshold: {STOP_DISTANCE}mm")
 print("Car will move forward in 2 seconds... LIFT CAR IF UNSURE!")
@@ -16,7 +16,7 @@ time.sleep(2)
 try:
     while True:
         # 1. Get a quick scan
-        scan = car.lidar_scan(samples=180) # Using fewer samples for faster reaction
+        scan = car.lidar_scan(samples=120) # Using fewer samples for faster reaction
         
         # 2. Extract the minimum distance in the front 40-degree cone
         # Angles: 340-359 and 0-20
