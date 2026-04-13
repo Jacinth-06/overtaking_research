@@ -6,8 +6,8 @@ car = JetRacer(init_lidar=True)
 car.arm(delay=3)
 
 # Configuration
-STOP_DISTANCE = 600.0  # Stop if object is closer than 800mm (80cm)
-DRIVE_SPEED = 0.3    # Slow crawl for testing
+STOP_DISTANCE = 400.0  # Stop if object is closer than 800mm (80cm)
+DRIVE_SPEED = 0.12   # Slow crawl for testing
 
 print(f"Safety Shield Active. Threshold: {STOP_DISTANCE}mm")
 print("Car will move forward in 2 seconds... LIFT CAR IF UNSURE!")
