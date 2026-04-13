@@ -39,7 +39,6 @@ if _USE_GPU:
     _gpu_m2 = cv2.cuda_GpuMat(); _gpu_m3 = cv2.cuda_GpuMat()
     _gpu_m4 = cv2.cuda_GpuMat(); _gpu_m5 = cv2.cuda_GpuMat()
     _gpu_morph = cv2.cuda.createMorphologyFilter(cv2.MORPH_CLOSE, cv2.CV_8UC1, _MORPH_KERNEL)
-    _gpu_stream = cv2.cuda.Stream()
 else:
     print("[gpu] No CUDA — falling back to CPU-only pipeline")
 
@@ -84,25 +83,24 @@ def open_camera():
 
 # ── Lane detection (GPU/CPU) ──────────────────────────────────────────────────
 def detect_lane_gpu(roi, w, hsv_lo, hsv_hi, min_area):
-    _gpu_src.upload(roi, stream=_gpu_stream)
-    cv2.cuda.cvtColor(_gpu_src, cv2.COLOR_BGR2HSV, _gpu_hsv, stream=_gpu_stream)
-    channels = cv2.cuda.split(_gpu_hsv, stream=_gpu_stream)
+    _gpu_src.upload(roi)
+    cv2.cuda.cvtColor(_gpu_src, cv2.COLOR_BGR2HSV, _gpu_hsv)
+    channels = cv2.cuda.split(_gpu_hsv)
     
-    cv2.cuda.threshold(channels[0], float(hsv_lo[0]), 255, cv2.THRESH_BINARY, dst=_gpu_m0, stream=_gpu_stream)
-    cv2.cuda.threshold(channels[0], float(hsv_hi[0]), 255, cv2.THRESH_BINARY_INV, dst=_gpu_m1, stream=_gpu_stream)
-    cv2.cuda.threshold(channels[1], float(hsv_lo[1]), 255, cv2.THRESH_BINARY, dst=_gpu_m2, stream=_gpu_stream)
-    cv2.cuda.threshold(channels[1], float(hsv_hi[1]), 255, cv2.THRESH_BINARY_INV, dst=_gpu_m3, stream=_gpu_stream)
-    cv2.cuda.threshold(channels[2], float(hsv_lo[2]), 255, cv2.THRESH_BINARY, dst=_gpu_m4, stream=_gpu_stream)
-    cv2.cuda.threshold(channels[2], float(hsv_hi[2]), 255, cv2.THRESH_BINARY_INV, dst=_gpu_m5, stream=_gpu_stream)
+    cv2.cuda.threshold(channels[0], float(hsv_lo[0]), 255, cv2.THRESH_BINARY, dst=_gpu_m0)
+    cv2.cuda.threshold(channels[0], float(hsv_hi[0]), 255, cv2.THRESH_BINARY_INV, dst=_gpu_m1)
+    cv2.cuda.threshold(channels[1], float(hsv_lo[1]), 255, cv2.THRESH_BINARY, dst=_gpu_m2)
+    cv2.cuda.threshold(channels[1], float(hsv_hi[1]), 255, cv2.THRESH_BINARY_INV, dst=_gpu_m3)
+    cv2.cuda.threshold(channels[2], float(hsv_lo[2]), 255, cv2.THRESH_BINARY, dst=_gpu_m4)
+    cv2.cuda.threshold(channels[2], float(hsv_hi[2]), 255, cv2.THRESH_BINARY_INV, dst=_gpu_m5)
     
-    cv2.cuda.bitwise_and(_gpu_m0, _gpu_m1, _gpu_mask, stream=_gpu_stream)
-    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m2, _gpu_mask, stream=_gpu_stream)
-    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m3, _gpu_mask, stream=_gpu_stream)
-    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m4, _gpu_mask, stream=_gpu_stream)
-    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m5, _gpu_mask, stream=_gpu_stream)
+    cv2.cuda.bitwise_and(_gpu_m0, _gpu_m1, _gpu_mask)
+    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m2, _gpu_mask)
+    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m3, _gpu_mask)
+    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m4, _gpu_mask)
+    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m5, _gpu_mask)
     
-    _gpu_morph.apply(_gpu_mask, _gpu_mask, stream=_gpu_stream)
-    _gpu_stream.waitForCompletion()
+    _gpu_morph.apply(_gpu_mask, _gpu_mask)
     mask = _gpu_mask.download()
     
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
