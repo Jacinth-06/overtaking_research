@@ -19,8 +19,8 @@ try:
         scan = car.lidar_scan(samples=120) # Using fewer samples for faster reaction
         
         # 2. Extract the minimum distance in the front 40-degree cone
-        # Angles: 340-359 and 0-20
-        front_distances = [dist for ang, dist in scan.items() if ang >= 340 or ang <= 20]
+        # Angles: 320-359 and 0-40
+        front_distances = [dist for ang, dist in scan.items() if ang >= 320 or ang <= 40]
         
         if front_distances:
             closest_front = min(front_distances)
