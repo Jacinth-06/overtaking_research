@@ -1,8 +1,17 @@
 """
-lane_follow.py — GPU-accelerated lane following + Flask live dashboard
+test_lane.py — GPU-accelerated lane following + Flask live dashboard
 Optimised for Jetson Nano 4 GB (CUDA cv2.cuda pipeline, low CPU footprint).
-Run with:  python test_lane.py
-Open browser at:  http://<jetson-ip>:5000
+
+Key optimisations vs the original CPU-only version:
+  • Resolution halved to 320×240  (4× fewer pixels)
+  • BGR→HSV, thresholding, morphology all run on the 128-core Maxwell GPU
+  • Annotation + JPEG encode only when a dashboard client is watching
+  • Frame skipping: only every 3rd frame is annotated
+  • car.stop() called only once on disable (no I2C spam)
+  • GStreamer pipeline does NOT constrain framerate so the ISP auto-exposure works
+
+Run:   python3 tests/test_lane.py
+Open:  http://<jetson-ip>:5000
 """
 
 import cv2
@@ -11,7 +20,7 @@ import threading
 import time
 from flask import Flask, Response, render_template_string, request, jsonify
 
-# ── Import your JetRacer class ────────────────────────────────────────────────
+# ── Import JetRacer ───────────────────────────────────────────────────────────
 from jetracer import JetRacer
 
 app = Flask(__name__)
@@ -27,16 +36,253 @@ print(f"[debug] OpenCV version: {cv2.__version__}")
 try:
     _USE_GPU = cv2.cuda.getCudaEnabledDeviceCount() > 0
     if not _USE_GPU:
-        print("[debug] CUDA device count is 0")
+        print("[debug] CUDA device count is 0 — check OpenCV build.")
 except Exception as e:
     _USE_GPU = False
     print(f"[debug] CUDA detection failed: {e}")
 
 if _USE_GPU:
     print("[gpu] CUDA device found — GPU-accelerated pipeline active")
-    # ... rest of GPU setup ...
-# (lines continue below, I will replace the whole block)
+    # Pre-allocate GpuMat buffers (avoids per-frame GPU malloc)
+    _gpu_src  = cv2.cuda_GpuMat()
+    _gpu_hsv  = cv2.cuda_GpuMat()
+    _gpu_mask = cv2.cuda_GpuMat()
+    _gpu_m0   = cv2.cuda_GpuMat(); _gpu_m1 = cv2.cuda_GpuMat()
+    _gpu_m2   = cv2.cuda_GpuMat(); _gpu_m3 = cv2.cuda_GpuMat()
+    _gpu_m4   = cv2.cuda_GpuMat(); _gpu_m5 = cv2.cuda_GpuMat()
+    # CUDA morphology filter — created once, reused every frame
+    _gpu_morph = cv2.cuda.createMorphologyFilter(
+        cv2.MORPH_CLOSE, cv2.CV_8UC1, _MORPH_KERNEL)
+    # NOTE: cv2.cuda.Stream() is NOT available in OpenCV 4.5.5 python bindings
+    #       so all GPU ops run synchronously on the default stream.
+else:
+    print("[gpu] No CUDA — falling back to CPU-only pipeline")
 
+# ── Global shared state ───────────────────────────────────────────────────────
+state = {
+    # HSV lane colour thresholds (tune in browser)
+    "h_lo": 20,  "h_hi": 35,   # hue  (20-35 = yellow lane markings)
+    "s_lo": 80,  "s_hi": 255,
+    "v_lo": 80,  "v_hi": 255,
+
+    # PID gains
+    "kp": 0.4,
+    "ki": 0.002,
+    "kd": 0.15,
+
+    # Drive settings
+    "speed": 0.18,         # forward throttle 0–1
+    "enabled": False,       # master enable/disable
+    "min_contour_area": 2000,
+
+    # Runtime (read-only from browser)
+    "error":      0.0,
+    "steer":      0.0,
+    "fps":        0,
+    "lane_found": False,
+}
+
+# PID integral / last-error accumulators (protected by lock)
+pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
+state_lock = threading.Lock()
+
+# Latest annotated frame for MJPEG stream
+frame_lock    = threading.Lock()
+latest_frame  = None   # raw bytes (JPEG)
+_has_clients  = False  # set True while a browser is streaming
+
+
+# ── Camera setup ─────────────────────────────────────────────────────────────
+def open_camera():
+    """Try GStreamer CSI pipeline (Jetson), fall back to /dev/video0."""
+    # DO NOT specify framerate — nvarguscamerasrc auto-exposure needs freedom
+    gst = (
+        "nvarguscamerasrc ! "
+        "video/x-raw(memory:NVMM),width=1280,height=720 ! "
+        "nvvidconv flip-method=0 ! "
+        f"video/x-raw,width={_CAM_W},height={_CAM_H},format=BGRx ! "
+        "videoconvert ! video/x-raw,format=BGR ! appsink drop=1"
+    )
+    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        print("[camera] CSI GStreamer pipeline OK")
+        return cap
+
+    cap = cv2.VideoCapture(0)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  _CAM_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _CAM_H)
+        print("[camera] USB /dev/video0 OK")
+        return cap
+
+    raise RuntimeError("No camera found")
+
+
+# ── GPU-accelerated lane detection ────────────────────────────────────────────
+def detect_lane_gpu(roi, w, hsv_lo, hsv_hi, min_area):
+    """
+    BGR→HSV, inRange (split+threshold+AND), morphology all on GPU.
+    Only the final 1-channel mask is downloaded for CPU contour finding.
+    """
+    _gpu_src.upload(roi)
+    cv2.cuda.cvtColor(_gpu_src, cv2.COLOR_BGR2HSV, _gpu_hsv)
+    channels = cv2.cuda.split(_gpu_hsv)  # [H, S, V]
+
+    # Per-channel threshold → 6 binary masks
+    cv2.cuda.threshold(channels[0], float(hsv_lo[0]), 255,
+                       cv2.THRESH_BINARY, dst=_gpu_m0)
+    cv2.cuda.threshold(channels[0], float(hsv_hi[0]), 255,
+                       cv2.THRESH_BINARY_INV, dst=_gpu_m1)
+    cv2.cuda.threshold(channels[1], float(hsv_lo[1]), 255,
+                       cv2.THRESH_BINARY, dst=_gpu_m2)
+    cv2.cuda.threshold(channels[1], float(hsv_hi[1]), 255,
+                       cv2.THRESH_BINARY_INV, dst=_gpu_m3)
+    cv2.cuda.threshold(channels[2], float(hsv_lo[2]), 255,
+                       cv2.THRESH_BINARY, dst=_gpu_m4)
+    cv2.cuda.threshold(channels[2], float(hsv_hi[2]), 255,
+                       cv2.THRESH_BINARY_INV, dst=_gpu_m5)
+
+    # Combine: mask = m0 & m1 & m2 & m3 & m4 & m5
+    cv2.cuda.bitwise_and(_gpu_m0, _gpu_m1, _gpu_mask)
+    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m2, _gpu_mask)
+    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m3, _gpu_mask)
+    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m4, _gpu_mask)
+    cv2.cuda.bitwise_and(_gpu_mask, _gpu_m5, _gpu_mask)
+
+    # Morphological close (fills gaps in lane markings)
+    _gpu_morph.apply(_gpu_mask, _gpu_mask)
+
+    # Download mask to CPU (~30 KB for 320×96 single channel)
+    mask = _gpu_mask.download()
+
+    # Contour finding (CPU — no CUDA equivalent)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        big = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(big) > min_area:
+            M = cv2.moments(big)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                error = (cx - w // 2) / (w // 2)
+                return error, True, cx
+
+    return 0.0, False, w // 2
+
+
+# ── CPU-only lane detection (fallback) ────────────────────────────────────────
+def detect_lane_cpu(roi, w, hsv_lo, hsv_hi, min_area):
+    """Pure-CPU fallback for non-CUDA OpenCV builds."""
+    hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, hsv_lo, hsv_hi)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _MORPH_KERNEL)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        big = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(big) > min_area:
+            M = cv2.moments(big)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"])
+                error = (cx - w // 2) / (w // 2)
+                return error, True, cx
+
+    return 0.0, False, w // 2
+
+
+# Select detection function once at import time
+_detect_lane = detect_lane_gpu if _USE_GPU else detect_lane_cpu
+
+
+# ── Cheap annotator (only runs when dashboard is open) ────────────────────────
+_ENCODE_PARAMS = [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY]
+
+def annotate_and_encode(frame, error, steer, lane_found, cx_lane, enabled, fps):
+    """Draw minimal HUD. Modifies frame in-place (no copy)."""
+    h, w = frame.shape[:2]
+    roi_top = int(h * 0.6)
+
+    # ROI line
+    cv2.line(frame, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
+
+    # Centre reference
+    cv2.line(frame, (w // 2, roi_top), (w // 2, h), (0, 200, 255), 1)
+
+    # Lane centroid
+    if lane_found:
+        cy = roi_top + (h - roi_top) // 2
+        cv2.circle(frame, (cx_lane, cy), 6, (0, 255, 0), -1)
+
+    # Compact HUD
+    status = "GO" if enabled else "STOP"
+    colour = (0, 220, 60) if enabled else (60, 60, 220)
+    cv2.putText(frame, f"{status} e:{error:+.1f} s:{steer:+.1f} {fps}fps",
+                (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, colour, 1)
+
+    _, buf = cv2.imencode(".jpg", frame, _ENCODE_PARAMS)
+    return buf.tobytes()
+
+
+# ── Control loop thread ───────────────────────────────────────────────────────
+def control_loop(car: JetRacer):
+    global latest_frame
+    cap = open_camera()
+    fps_counter, fps_time = 0, time.time()
+    fps_val = 0
+    frame_tick = 0              # counts frames for stream-skip
+    was_enabled = False         # tracks enable→disable transitions
+
+    print("[loop] Starting control loop …")
+    print("[loop] Auto-drive DISABLED. Open dashboard → click GO to drive.")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.005)
+            continue
+
+        h, w = frame.shape[:2]
+        roi_top = int(h * 0.6)
+        roi = frame[roi_top:, :]
+
+        # ── Snapshot tunables under lock ──────────────────────────────────
+        with state_lock:
+            kp, ki, kd = state["kp"], state["ki"], state["kd"]
+            speed       = state["speed"]
+            enabled     = state["enabled"]
+            min_area    = state["min_contour_area"]
+            hsv_lo = np.array([state["h_lo"], state["s_lo"], state["v_lo"]],
+                              dtype=np.uint8)
+            hsv_hi = np.array([state["h_hi"], state["s_hi"], state["v_hi"]],
+                              dtype=np.uint8)
+
+        # ── Detection (GPU or CPU) ───────────────────────────────────────
+        error, lane_found, cx_lane = _detect_lane(
+            roi, w, hsv_lo, hsv_hi, min_area)
+
+        # ── PID ──────────────────────────────────────────────────────────
+        now = time.time()
+        dt  = max(now - pid_state["last_time"], 0.001)
+
+        pid_state["integral"]  += error * dt
+        pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
+        derivative              = (error - pid_state["last_error"]) / dt
+        pid_state["last_error"] = error
+        pid_state["last_time"]  = now
+
+        steer = kp * error + ki * pid_state["integral"] + kd * derivative
+        steer = max(-1.0, min(1.0, steer))
+
+        # ── Drive (only call stop() once on transition) ──────────────────
+        if enabled:
+            car.steer(steer)
+            car.forward(speed if lane_found else speed * 0.5)
+            was_enabled = True
+        elif was_enabled:
+            car.stop()
+            was_enabled = False
+            print("[loop] Auto-drive disabled — waiting for GO …")
 
         # ── FPS counter ──────────────────────────────────────────────────
         fps_counter += 1
@@ -54,7 +300,7 @@ if _USE_GPU:
 
         # ── Stream annotation (skip frames if nobody is watching) ────────
         frame_tick += 1
-        if _has_clients and (frame_tick % 3 == 0):   # annotate every 3rd frame
+        if _has_clients and (frame_tick % 3 == 0):
             jpeg_bytes = annotate_and_encode(
                 frame, error, steer, lane_found, cx_lane, enabled, fps_val)
             with frame_lock:
@@ -131,7 +377,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat"><span class="stat-val" id="v-fps">0</span><span class="stat-lbl">fps</span></div>
       <div class="stat"><span class="stat-val" id="v-err">0.00</span><span class="stat-lbl">error</span></div>
       <div class="stat"><span class="stat-val" id="v-str">0.00</span><span class="stat-lbl">steer</span></div>
-      <div class="stat"><span class="stat-val" id="v-lane">—</span><span class="stat-lbl">lane</span></div>
+      <div class="stat"><span class="stat-val" id="v-lane">&mdash;</span><span class="stat-lbl">lane</span></div>
     </div>
     <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
@@ -171,7 +417,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <hr class="divider">
-    <h2>HSV mask — hue (lane colour)</h2>
+    <h2>HSV mask &mdash; hue (lane colour)</h2>
     <div class="slider-row">
       <label>H lo</label>
       <input type="range" id="h_lo" min="0" max="179" value="20" step="1">
@@ -197,8 +443,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h2>Min contour area</h2>
     <div class="slider-row">
       <label>Area</label>
-      <input type="range" id="min_contour_area" min="50" max="5000" value="500" step="50">
-      <span class="val" id="v-min_contour_area">500</span>
+      <input type="range" id="min_contour_area" min="200" max="20000" value="2000" step="100">
+      <span class="val" id="v-min_contour_area">2000</span>
     </div>
   </div>
 
@@ -235,7 +481,7 @@ async function poll() {
     document.getElementById("v-fps").textContent  = d.fps;
     document.getElementById("v-err").textContent  = d.error.toFixed(2);
     document.getElementById("v-str").textContent  = d.steer.toFixed(2);
-    document.getElementById("v-lane").textContent = d.lane_found ? "✓" : "✗";
+    document.getElementById("v-lane").textContent = d.lane_found ? "\u2713" : "\u2717";
     document.getElementById("v-lane").style.color = d.lane_found ? "#00d4aa" : "#ff4d4d";
     // Error bar: map -1…+1 to 0%…100%
     const pct = (d.error + 1) / 2 * 100;
