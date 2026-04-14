@@ -238,6 +238,9 @@ def control_loop(car: JetRacer):
     while True:
         ret, frame = cap.read()
         print(f"[debug] Raw frame shape: {frame.shape}, dtype: {frame.dtype}")
+        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
+            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+            print(f"[debug] Resized frame to: {frame.shape}")
         if len(frame.shape) == 3 and frame.shape[2] == 2:
             try:
                 frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
