@@ -217,6 +217,12 @@ def process_frame(frame, s, annotate: bool):
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
 def _do_encode(img):
     _, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    print(f"[debug] Encoding JPEG: shape={img.shape}, dtype={img.dtype}")
+    ret, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    if not ret:
+        print("[error] JPEG encoding failed!")
+        return
+    print(f"[debug] JPEG encoding success, size={len(jpeg.tobytes())} bytes")
     with frame_lock:
         global latest_frame
         latest_frame = jpeg.tobytes()
@@ -231,6 +237,19 @@ def control_loop(car: JetRacer):
 
     while True:
         ret, frame = cap.read()
+        print(f"[debug] Raw frame shape: {frame.shape}, dtype: {frame.dtype}")
+        if len(frame.shape) == 3 and frame.shape[2] == 2:
+            try:
+                frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
+                print(f"[debug] Converted YUYV to BGR: {frame.shape}, dtype: {frame.dtype}")
+            except Exception as e:
+                print(f"[error] YUYV to BGR conversion failed: {e}")
+                continue
+        elif len(frame.shape) == 2:
+            print("[warn] Frame has 2 dimensions (grayscale or Bayer), skipping.")
+            continue
+        else:
+            print(f"[debug] Frame assumed BGR: {frame.shape}, dtype: {frame.dtype}")
         if not ret:
             time.sleep(0.01)
             continue
