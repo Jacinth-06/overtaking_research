@@ -71,23 +71,10 @@ _encode_pool = ThreadPoolExecutor(max_workers=1)
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 def open_camera():
+    
     """
-    GStreamer CSI pipeline at 320×240.
-    nvvidconv stays in NVMM until videoconvert → BGR on CPU.
-    Falls back to USB camera.
+    Always use USB camera (/dev/video0) and skip Jetson CSI/GStreamer pipeline.
     """
-    gst = (
-        f"nvarguscamerasrc ! "
-        f"video/x-raw(memory:NVMM),width={WIDTH},height={HEIGHT},framerate=30/1 ! "
-        f"nvvidconv flip-method=0 ! "
-        f"video/x-raw,width={WIDTH},height={HEIGHT},format=BGRx ! "
-        f"videoconvert ! video/x-raw,format=BGR ! appsink drop=1"
-    )
-    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-    if cap.isOpened():
-        print(f"[camera] CSI GStreamer {WIDTH}×{HEIGHT} OK")
-        return cap
-
     cap = cv2.VideoCapture(0)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
@@ -95,8 +82,7 @@ def open_camera():
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # reduce latency
         print(f"[camera] USB /dev/video0 {WIDTH}×{HEIGHT} OK")
         return cap
-
-    raise RuntimeError("No camera found")
+    raise RuntimeError("No camera found on /dev/video0")
 
 
 # ── GPU HSV mask ──────────────────────────────────────────────────────────────
