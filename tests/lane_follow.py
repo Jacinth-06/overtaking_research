@@ -216,7 +216,8 @@ def process_frame(frame, s, annotate: bool):
 
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
 def _do_encode(img):
-    _, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    print(f"[debug] Encoding image mean: {np.mean(img):.2f}")
+    cv2.imwrite("debug_frame.jpg", img)
     print(f"[debug] Encoding JPEG: shape={img.shape}, dtype={img.dtype}")
     ret, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
     if not ret:
@@ -265,6 +266,7 @@ def control_loop(car: JetRacer):
 
         # Annotate only if someone is watching; encode every Nth frame
         do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
+        print(f"[debug] Frame mean: {np.mean(frame):.2f}")
         annotated, error, steer, lane_found = process_frame(frame, s_copy, do_annotate)
 
         # Async encode (fire-and-forget; previous encode may still be running — that's fine)
