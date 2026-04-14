@@ -23,7 +23,8 @@ from jetracer import JetRacer
 
 import os
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"        # Disable MSMF (Windows)
-os.environ["OPENCV_VIDEOIO_PRIORITY_GSTREAMER"] = "0"   # Disable GStreamer
+# GStreamer MUST stay enabled — CSI camera outputs raw Bayer (RG10)
+# and needs nvarguscamerasrc for ISP debayering
 os.environ["OPENCV_VIDEOIO_PRIORITY_FFMPEG"] = "0"      # Disable FFMPEG
 
 app = Flask(__name__)
@@ -75,19 +76,55 @@ _encode_pool = ThreadPoolExecutor(max_workers=1)
 
 
 # ── Camera ────────────────────────────────────────────────────────────────────
+def _gstreamer_pipeline(
+    sensor_id=0,
+    capture_width=1280, capture_height=720,
+    display_width=WIDTH, display_height=HEIGHT,
+    framerate=60, flip_method=0,
+):
+    """
+    Build a GStreamer pipeline string for nvarguscamerasrc (Jetson CSI cameras).
+    The ISP handles debayering RG10 → NV12 in hardware, then we convert to BGR
+    for OpenCV.
+    """
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+        f"video/x-raw(memory:NVMM), "
+        f"width=(int){capture_width}, height=(int){capture_height}, "
+        f"framerate=(fraction){framerate}/1, format=(string)NV12 ! "
+        f"nvvidconv flip-method={flip_method} ! "
+        f"video/x-raw, width=(int){display_width}, height=(int){display_height}, "
+        f"format=(string)BGRx ! "
+        f"videoconvert ! "
+        f"video/x-raw, format=(string)BGR ! "
+        f"appsink drop=1 max-buffers=1"
+    )
+
+
 def open_camera():
-    
     """
-    Always use USB camera (/dev/video0) and skip Jetson CSI/GStreamer pipeline.
+    Open the CSI camera via nvarguscamerasrc GStreamer pipeline.
+    Falls back to USB /dev/video0 if GStreamer pipeline fails.
     """
+    # --- Try CSI camera via GStreamer (nvarguscamerasrc) ---
+    gst = _gstreamer_pipeline()
+    print(f"[camera] Trying GStreamer pipeline:\n  {gst}")
+    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        print(f"[camera] CSI camera via nvarguscamerasrc {WIDTH}×{HEIGHT} OK")
+        return cap
+    print("[camera] GStreamer pipeline failed, trying USB fallback...")
+
+    # --- Fallback: USB camera ---
     cap = cv2.VideoCapture(0)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # reduce latency
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         print(f"[camera] USB /dev/video0 {WIDTH}×{HEIGHT} OK")
         return cap
-    raise RuntimeError("No camera found on /dev/video0")
+
+    raise RuntimeError("No camera found (CSI and USB both failed)")
 
 
 # ── GPU HSV mask ──────────────────────────────────────────────────────────────
@@ -238,25 +275,17 @@ def control_loop(car: JetRacer):
 
     while True:
         ret, frame = cap.read()
-        print(f"[debug] Raw frame shape: {frame.shape}, dtype: {frame.dtype}")
-        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
-            frame = cv2.resize(frame, (WIDTH, HEIGHT))
-            print(f"[debug] Resized frame to: {frame.shape}")
-        if len(frame.shape) == 3 and frame.shape[2] == 2:
-            try:
-                frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
-                print(f"[debug] Converted YUYV to BGR: {frame.shape}, dtype: {frame.dtype}")
-            except Exception as e:
-                print(f"[error] YUYV to BGR conversion failed: {e}")
-                continue
-        elif len(frame.shape) == 2:
-            print("[warn] Frame has 2 dimensions (grayscale or Bayer), skipping.")
-            continue
-        else:
-            print(f"[debug] Frame assumed BGR: {frame.shape}, dtype: {frame.dtype}")
         if not ret:
             time.sleep(0.01)
             continue
+            
+        # Ensure frame is 3D (BGR)
+        if len(frame.shape) != 3:
+            print("[warn] Frame is not 3D, skipping.")
+            continue
+            
+        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
+            frame = cv2.resize(frame, (WIDTH, HEIGHT))
 
         with state_lock:
             s_copy = dict(state)
