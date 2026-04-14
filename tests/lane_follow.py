@@ -21,6 +21,11 @@ from flask import Flask, Response, render_template_string, request, jsonify
 
 from jetracer import JetRacer
 
+import os
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"        # Disable MSMF (Windows)
+os.environ["OPENCV_VIDEOIO_PRIORITY_GSTREAMER"] = "0"   # Disable GStreamer
+os.environ["OPENCV_VIDEOIO_PRIORITY_FFMPEG"] = "0"      # Disable FFMPEG
+
 app = Flask(__name__)
 
 # ── CUDA availability check ───────────────────────────────────────────────────
