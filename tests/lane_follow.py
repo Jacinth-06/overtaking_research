@@ -27,11 +27,12 @@ app = Flask(__name__)
 USE_CUDA = cv2.cuda.getCudaEnabledDeviceCount() > 0
 if USE_CUDA:
     print("[init] CUDA device found — GPU path active")
-    _gpu_frame  = cv2.cuda_GpuMat()
-    _gpu_hsv    = cv2.cuda_GpuMat()
-    _gpu_mask   = cv2.cuda_GpuMat()
+    _gpu_frame = cv2.cuda_GpuMat()
+    _gpu_hsv   = cv2.cuda_GpuMat()
+    _gpu_mask  = cv2.cuda_GpuMat()
 else:
     print("[init] No CUDA device — falling back to CPU")
+    _gpu_frame = _gpu_hsv = _gpu_mask = None
 
 # ── Config constants ──────────────────────────────────────────────────────────
 WIDTH, HEIGHT   = 320, 240          # lower res = less GPU/CPU work
@@ -99,22 +100,48 @@ def open_camera():
 
 
 # ── GPU HSV mask ──────────────────────────────────────────────────────────────
-def gpu_hsv_mask(roi_bgr, lo, hi):
+# Detect which cv2.cuda.cvtColor API is available at startup.
+# OCV 4.5.x  → returns a new GpuMat  (functional style)
+# OCV 4.6+   → writes into dst arg   (in-place style)
+def _make_gpu_hsv_mask():
     """
-    Convert ROI to HSV on GPU, threshold on CPU.
-    cv2.cuda.inRange on OCV 4.5.x doesn't accept numpy scalar bounds,
-    so we download the HSV frame and run inRange on CPU — the expensive
-    cvtColor still runs on GPU.
+    Factory: returns the correct gpu_hsv_mask implementation for this
+    OpenCV build so the if-branch is paid once, not every frame.
     """
-    _gpu_frame.upload(roi_bgr)
-    cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV, _gpu_hsv)
-    hsv_cpu = _gpu_hsv.download()           # small 320×96 ROI — cheap
-    return cv2.inRange(hsv_cpu, lo, hi)
+    # Probe with a 1×1 dummy to see which API works
+    probe = cv2.cuda_GpuMat()
+    probe.upload(np.zeros((1, 1, 3), dtype=np.uint8))
+    try:
+        result = cv2.cuda.cvtColor(probe, cv2.COLOR_BGR2HSV)
+        if result is not None and not result.empty():
+            # Functional API (OCV 4.5.x) — cvtColor returns the output GpuMat
+            print("[cuda] cvtColor: functional API (returns GpuMat)")
+            def _mask_functional(roi_bgr, lo, hi):
+                _gpu_frame.upload(roi_bgr)
+                hsv_gpu = cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV)
+                hsv_cpu = hsv_gpu.download()
+                return cv2.inRange(hsv_cpu, lo, hi)
+            return _mask_functional
+    except Exception:
+        pass
+
+    # In-place API (OCV 4.6+) — cvtColor writes into dst
+    print("[cuda] cvtColor: in-place API (dst arg)")
+    def _mask_inplace(roi_bgr, lo, hi):
+        _gpu_frame.upload(roi_bgr)
+        cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV, _gpu_hsv)
+        hsv_cpu = _gpu_hsv.download()
+        return cv2.inRange(hsv_cpu, lo, hi)
+    return _mask_inplace
 
 
 def cpu_hsv_mask(roi_bgr, lo, hi):
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     return cv2.inRange(hsv, lo, hi)
+
+
+# Build the correct GPU mask fn for this OpenCV version (probed once at startup)
+gpu_hsv_mask = _make_gpu_hsv_mask() if USE_CUDA else None
 
 
 # ── Lane detection + PID ──────────────────────────────────────────────────────
@@ -126,8 +153,8 @@ def process_frame(frame, s, annotate: bool):
     lo = np.array([s["h_lo"], s["s_lo"], s["v_lo"]], dtype=np.uint8)
     hi = np.array([s["h_hi"], s["s_hi"], s["v_hi"]], dtype=np.uint8)
 
-    # --- Mask (GPU or CPU) ---
-    mask = gpu_hsv_mask(roi, lo, hi) if USE_CUDA else cpu_hsv_mask(roi, lo, hi)
+    # --- Mask: gpu_hsv_mask is None when CUDA unavailable ---
+    mask = gpu_hsv_mask(roi, lo, hi) if gpu_hsv_mask is not None else cpu_hsv_mask(roi, lo, hi)
 
     # --- Morphological cleanup (small kernel for speed) ---
     k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
