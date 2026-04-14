@@ -100,11 +100,16 @@ def open_camera():
 
 # ── GPU HSV mask ──────────────────────────────────────────────────────────────
 def gpu_hsv_mask(roi_bgr, lo, hi):
-    """Convert ROI to HSV and threshold on GPU. Returns CPU mask."""
+    """
+    Convert ROI to HSV on GPU, threshold on CPU.
+    cv2.cuda.inRange on OCV 4.5.x doesn't accept numpy scalar bounds,
+    so we download the HSV frame and run inRange on CPU — the expensive
+    cvtColor still runs on GPU.
+    """
     _gpu_frame.upload(roi_bgr)
     cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV, _gpu_hsv)
-    cv2.cuda.inRange(_gpu_hsv, lo, hi, _gpu_mask)
-    return _gpu_mask.download()
+    hsv_cpu = _gpu_hsv.download()           # small 320×96 ROI — cheap
+    return cv2.inRange(hsv_cpu, lo, hi)
 
 
 def cpu_hsv_mask(roi_bgr, lo, hi):
