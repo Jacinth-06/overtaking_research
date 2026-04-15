@@ -63,6 +63,7 @@ state = {
     "min_contour_area": 300,       # per-zone contour threshold (lower since split)
     "lane_width": 200,             # expected pixel distance between lane lines
     "recovery_steer": 0.6,        # multiplier for lane-loss recovery steering
+    "roi_side_limit": 0.30,        # trim 30% from left and 30% from right (keep center 40%)
     # telemetry (read-only from browser)
     "error": 0.0,  "steer": 0.0,  "fps": 0,
     "lane_found": False,
@@ -199,7 +200,11 @@ def process_frame(frame, s, annotate: bool):
 
     h, w = frame.shape[:2]
     roi_top = int(h * ROI_FRAC)
-    roi = frame[roi_top:h, :]
+    
+    # Horizontal ROI cropping
+    x_start = int(w * s["roi_side_limit"])
+    x_end   = w - x_start
+    roi = frame[roi_top:h, x_start:x_end]
 
     lo = np.array([s["h_lo"], s["s_lo"], s["v_lo"]], dtype=np.uint8)
     hi = np.array([s["h_hi"], s["s_hi"], s["v_hi"]], dtype=np.uint8)
@@ -231,7 +236,9 @@ def process_frame(frame, s, annotate: bool):
         M = cv2.moments(cnt)
         if M["m00"] <= 0:
             continue
-        cx = int(M["m10"] / M["m00"])
+        
+        # Map ROI coords back to full frame coords
+        cx = int(M["m10"] / M["m00"]) + x_start
         cy = int(M["m01"] / M["m00"])
 
         if cx < left_boundary and area > best_left_area:
@@ -285,6 +292,10 @@ def process_frame(frame, s, annotate: bool):
         # ROI boundary line
         cv2.line(annotated, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
 
+        # Horizontal crop lines
+        cv2.line(annotated, (x_start, roi_top), (x_start, h), (255, 0, 255), 1)
+        cv2.line(annotated, (x_end, roi_top), (x_end, h), (255, 0, 255), 1)
+
         # Zone boundaries (faint vertical lines)
         cv2.line(annotated, (left_boundary, roi_top), (left_boundary, h), (100, 100, 100), 1)
         cv2.line(annotated, (right_boundary, roi_top), (right_boundary, h), (100, 100, 100), 1)
@@ -292,8 +303,8 @@ def process_frame(frame, s, annotate: bool):
         # Mask overlay
         mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         mask_3ch[:, :, 0] = 0
-        annotated[roi_top:h, :] = cv2.addWeighted(
-            annotated[roi_top:h, :], 0.7, mask_3ch, 0.3, 0)
+        annotated[roi_top:h, x_start:x_end] = cv2.addWeighted(
+            annotated[roi_top:h, x_start:x_end], 0.7, mask_3ch, 0.3, 0)
 
         cy_mid = roi_top + (h - roi_top) // 2
 
@@ -540,6 +551,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="val" id="v-lane_width">200</span>
     </div>
     <div class="slider-row">
+      <label>Side Crop</label>
+      <input type="range" id="roi_side_limit" min="0" max="0.45" value="0.30" step="0.01">
+      <span class="val" id="v-roi_side_limit">0.30</span>
+    </div>
+    <div class="slider-row">
       <label>Recovery</label>
       <input type="range" id="recovery_steer" min="0" max="1" value="0.6" step="0.05">
       <span class="val" id="v-recovery_steer">0.60</span>
@@ -585,7 +601,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 <script>
 const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","s_hi","v_lo","v_hi",
-                 "min_contour_area","lane_width","recovery_steer"];
+                 "min_contour_area","lane_width","recovery_steer","roi_side_limit"];
 sliders.forEach(id => {
   const el = document.getElementById(id);
   const disp = document.getElementById("v-"+id);
@@ -594,7 +610,7 @@ sliders.forEach(id => {
     if (id === "speed") {
       disp.textContent = (v/100).toFixed(2);
       sendParam(id, v/100);
-    } else if (id === "recovery_steer") {
+    } else if (id === "recovery_steer" || id === "roi_side_limit") {
       disp.textContent = v.toFixed(2);
       sendParam(id, v);
     } else {
