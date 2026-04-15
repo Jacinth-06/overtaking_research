@@ -46,7 +46,7 @@ WIDTH, HEIGHT   = 320, 240          # lower res = less GPU/CPU work
 ENCODE_EVERY    = 3                  # encode JPEG only every Nth frame
 JPEG_QUALITY    = 30                 # lower = smaller payload, less CPU
 MJPEG_INTERVAL  = 1 / 15            # 15 fps to browser
-ROI_FRAC        = 0.60               # bottom 40% used as ROI
+ROI_FRAC        = 0.50               # bottom 50% used as ROI
 MAX_LOST_FRAMES = 15                 # ~0.5s at 30fps → full stop
 
 # Pre-allocate morphological kernel (constant — no need to recreate per frame)
