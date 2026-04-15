@@ -49,9 +49,9 @@ ROI_FRAC        = 0.60               # bottom 40% used as ROI
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = {
-    "h_lo": 20,  "h_hi": 35,
-    "s_lo": 80,  "s_hi": 255,
-    "v_lo": 80,  "v_hi": 255,
+    "h_lo": 0,  "h_hi": 180,
+    "s_lo": 0,  "s_hi": 50,
+    "v_lo": 200,  "v_hi": 255,
     "kp": 0.4,   "ki": 0.002,  "kd": 0.15,
     "speed": 0.18,
     "enabled": False,
