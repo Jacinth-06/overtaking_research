@@ -68,6 +68,8 @@ state = {
 pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
 state_lock = threading.Lock()
 
+_last_steer = 0.0
+
 # Latest JPEG bytes for MJPEG stream
 frame_lock   = threading.Lock()
 latest_frame = None
@@ -159,6 +161,7 @@ gpu_hsv_mask = _make_gpu_hsv_mask() if USE_CUDA else None
 
 # ── Simple Single-Line detection + PID ─────────────────────────────────────────
 def process_frame(frame, s, annotate: bool):
+    global _last_steer
     h, w = frame.shape[:2]
     roi_top = int(h * ROI_FRAC)
     
@@ -197,22 +200,24 @@ def process_frame(frame, s, annotate: bool):
 
     if line_found:
         error = (line_cx - w // 2) / (w // 2)
+
+        # --- PID ---
+        now = time.time()
+        dt  = max(now - pid_state["last_time"], 0.001)
+        pid_state["integral"]  += error * dt
+        pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
+        derivative              = (error - pid_state["last_error"]) / dt
+        pid_state["last_error"] = error
+        pid_state["last_time"]  = now
+
+        steer = (s["kp"] * error
+               + s["ki"] * pid_state["integral"]
+               + s["kd"] * derivative)
+        steer = max(-1.0, min(1.0, steer))
+        _last_steer = steer
     else:
         error = 0.0
-
-    # --- PID ---
-    now = time.time()
-    dt  = max(now - pid_state["last_time"], 0.001)
-    pid_state["integral"]  += error * dt
-    pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
-    derivative              = (error - pid_state["last_error"]) / dt
-    pid_state["last_error"] = error
-    pid_state["last_time"]  = now
-
-    steer = (s["kp"] * error
-           + s["ki"] * pid_state["integral"]
-           + s["kd"] * derivative)
-    steer = max(-1.0, min(1.0, steer))
+        steer = _last_steer
 
     # --- Annotate ---
     if annotate:
@@ -308,12 +313,8 @@ def control_loop(car: JetRacer):
             fps_counter, fps_time = 0, time.time()
 
         if s_copy["enabled"]:
-            if line_found:
-                car.steer(steer)
-                car.forward(s_copy["speed"])
-            else:
-                car.steer(0.0)
-                car.stop()
+            car.steer(steer)
+            car.forward(s_copy["speed"])
         else:
             car.stop()
 
