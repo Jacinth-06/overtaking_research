@@ -20,9 +20,9 @@ class JetRacer:
 
     # --- Steering limits (microseconds) ---
     # NOTE: reversed — servo is physically inverted
-    STEER_LEFT     = 2000
+    STEER_LEFT     = 2100
     STEER_CENTER   = 1500
-    STEER_RIGHT    = 1000
+    STEER_RIGHT    = 900
 
     # --- Throttle limits (microseconds) ---
     THROTTLE_NEUTRAL  = 1500
