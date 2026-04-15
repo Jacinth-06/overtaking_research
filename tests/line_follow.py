@@ -45,7 +45,7 @@ WIDTH, HEIGHT   = 320, 240          # lower res = less GPU/CPU work
 ENCODE_EVERY    = 3                  # encode JPEG only every Nth frame
 JPEG_QUALITY    = 30                 # lower = smaller payload, less CPU
 MJPEG_INTERVAL  = 1 / 15            # 15 fps to browser
-ROI_FRAC        = 0.50               # bottom 50% used as ROI
+ROI_FRAC        = 0.65              # bottom 50% used as ROI
 
 # Pre-allocate morphological kernel (constant — no need to recreate per frame)
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -199,7 +199,7 @@ def process_frame(frame, s, annotate: bool):
     line_found = line_cx is not None
 
     if line_found:
-        error = (line_cx - w // 2) / (w // 2)
+        error = (line_cx - w // 2) / (w // 2)* 2
 
         # --- PID ---
         now = time.time()
