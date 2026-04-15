@@ -330,7 +330,7 @@ def control_loop(car: JetRacer):
     cap.release()
 
 
-# ── Flask / dashboard ─────────────────────────────────────────────────────────
+# ── Flask / dashboard ───────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -439,6 +439,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="val" id="v-s_lo">80</span>
     </div>
     <div class="slider-row">
+      <label>S hi</label>
+      <input type="range" id="s_hi" min="0" max="255" value="255" step="1">
+      <span class="val" id="v-s_hi">255</span>
+    </div>
+    <div class="slider-row">
+      <label>V hi</label>
+      <input type="range" id="v_hi" min="0" max="255" value="255" step="1">
+      <span class="val" id="v-v_hi">255</span>
+    </div>
+    <div class="slider-row">
       <label>V lo</label>
       <input type="range" id="v_lo" min="0" max="255" value="80" step="1">
       <span class="val" id="v-v_lo">80</span>
@@ -453,7 +463,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 <script>
-const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","v_lo","min_contour_area"];
+const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","s_hi","v_lo","v_hi","min_contour_area"];
 sliders.forEach(id => {
   const el = document.getElementById(id);
   const disp = document.getElementById("v-"+id);
