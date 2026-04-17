@@ -234,7 +234,7 @@ def process_frame(frame, s, annotate: bool):
 
     # --- Error & steering ---
     if lane_found:
-        error = (lane_center - w // 2) / (w // 2) * 2   # ×2 gain
+        error = (lane_center - w // 2) / (w // 2) * 3  # ×2 gain
 
         # --- PID ---
         now = time.time()
