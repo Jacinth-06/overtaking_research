@@ -3,11 +3,13 @@ lane_follow.py — GPU-accelerated dual-lane follower + Flask dashboard
 Optimised for Jetson Nano 4 GB, black road with white lines on both sides.
 
 Detection strategy:
-  • HSV mask isolates white lane lines
-  • ROI split into left zone / right zone
-  • Largest contour in each zone → left_cx, right_cx
-  • Lane center = midpoint (or inferred from one line + expected width)
-  • Lane-loss memory prevents edge crashes
+  • HSV mask isolates white lane lines.
+  • ROI split into left zone / right zone.
+  • Largest contour in each zone → left_cx, right_cx.
+  • Both found → lane center = midpoint.
+  • One found  → lane center = inferred from detected line + lane_width.
+  • None found → hold last steer value until lane is found again.
+  • Error gain multiplied by 2 for sharper response.
 
 Run:   python lane_follow.py
 Open:  http://<jetson-ip>:5000
@@ -46,8 +48,7 @@ WIDTH, HEIGHT   = 320, 240          # lower res = less GPU/CPU work
 ENCODE_EVERY    = 3                  # encode JPEG only every Nth frame
 JPEG_QUALITY    = 30                 # lower = smaller payload, less CPU
 MJPEG_INTERVAL  = 1 / 15            # 15 fps to browser
-ROI_FRAC        = 0.50               # bottom 50% used as ROI
-MAX_LOST_FRAMES = 15                 # ~0.5s at 30fps → full stop
+ROI_FRAC        = 0.65              # bottom 35% used as ROI
 
 # Pre-allocate morphological kernel (constant — no need to recreate per frame)
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -60,22 +61,18 @@ state = {
     "kp": 0.55,   "ki": 0.003,  "kd": 0.25,
     "speed": 0.15,
     "enabled": False,
-    "min_contour_area": 300,       # per-zone contour threshold (lower since split)
+    "min_contour_area": 300,
     "lane_width": 200,             # expected pixel distance between lane lines
-    "recovery_steer": 0.6,        # multiplier for lane-loss recovery steering
-    "roi_side_limit": 0.30,        # trim 30% from left and 30% from right (keep center 40%)
+    "roi_side_limit": 0.0,
     # telemetry (read-only from browser)
     "error": 0.0,  "steer": 0.0,  "fps": 0,
     "lane_found": False,
-    "left_det": False, "right_det": False,
 }
 
 pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
 state_lock = threading.Lock()
 
-# Lane-loss memory (accessed only from control-loop thread — no lock needed)
-_last_good_error = 0.0
-_lost_count      = 0
+_last_steer = 0.0
 
 # Latest JPEG bytes for MJPEG stream
 frame_lock   = threading.Lock()
@@ -98,8 +95,6 @@ def _gstreamer_pipeline(
 ):
     """
     Build a GStreamer pipeline string for nvarguscamerasrc (Jetson CSI cameras).
-    The ISP handles debayering RG10 → NV12 in hardware, then we convert to BGR
-    for OpenCV.
     """
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
@@ -114,12 +109,7 @@ def _gstreamer_pipeline(
         f"appsink drop=1 max-buffers=1"
     )
 
-
 def open_camera():
-    """
-    Open the CSI camera via nvarguscamerasrc GStreamer pipeline.
-    Falls back to USB /dev/video0 if GStreamer pipeline fails.
-    """
     # --- Try CSI camera via GStreamer (nvarguscamerasrc) ---
     gst = _gstreamer_pipeline()
     print(f"[camera] Trying GStreamer pipeline:\n  {gst}")
@@ -142,21 +132,12 @@ def open_camera():
 
 
 # ── GPU HSV mask ──────────────────────────────────────────────────────────────
-# Detect which cv2.cuda.cvtColor API is available at startup.
-# OCV 4.5.x  → returns a new GpuMat  (functional style)
-# OCV 4.6+   → writes into dst arg   (in-place style)
 def _make_gpu_hsv_mask():
-    """
-    Factory: returns the correct gpu_hsv_mask implementation for this
-    OpenCV build so the if-branch is paid once, not every frame.
-    """
-    # Probe with a 1×1 dummy to see which API works
     probe = cv2.cuda_GpuMat()
     probe.upload(np.zeros((1, 1, 3), dtype=np.uint8))
     try:
         result = cv2.cuda.cvtColor(probe, cv2.COLOR_BGR2HSV)
         if result is not None and not result.empty():
-            # Functional API (OCV 4.5.x) — cvtColor returns the output GpuMat
             print("[cuda] cvtColor: functional API (returns GpuMat)")
             def _mask_functional(roi_bgr, lo, hi):
                 _gpu_frame.upload(roi_bgr)
@@ -167,7 +148,6 @@ def _make_gpu_hsv_mask():
     except Exception:
         pass
 
-    # In-place API (OCV 4.6+) — cvtColor writes into dst
     print("[cuda] cvtColor: in-place API (dst arg)")
     def _mask_inplace(roi_bgr, lo, hi):
         _gpu_frame.upload(roi_bgr)
@@ -176,31 +156,19 @@ def _make_gpu_hsv_mask():
         return cv2.inRange(hsv_cpu, lo, hi)
     return _mask_inplace
 
-
 def cpu_hsv_mask(roi_bgr, lo, hi):
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     return cv2.inRange(hsv, lo, hi)
 
-
-# Build the correct GPU mask fn for this OpenCV version (probed once at startup)
 gpu_hsv_mask = _make_gpu_hsv_mask() if USE_CUDA else None
 
 
 # ── Dual-lane detection + PID ─────────────────────────────────────────────────
 def process_frame(frame, s, annotate: bool):
-    """
-    Detect left and right white lane lines, compute lane center error, run PID.
-
-    Zone layout within the ROI:
-        LEFT_ZONE:  x in [0, 0.40 * w)
-        DEAD_ZONE:  x in [0.40 * w, 0.60 * w)   (ignored — road centre)
-        RIGHT_ZONE: x in [0.60 * w, w)
-    """
-    global _last_good_error, _lost_count
-
+    global _last_steer
     h, w = frame.shape[:2]
     roi_top = int(h * ROI_FRAC)
-    
+
     # Horizontal ROI cropping
     x_start = int(w * s["roi_side_limit"])
     x_end   = w - x_start
@@ -219,12 +187,12 @@ def process_frame(frame, s, annotate: bool):
     # --- Contours ---
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    left_boundary  = int(w * 0.40)
-    right_boundary = int(w * 0.60)
-    min_area       = s["min_contour_area"]
-    lane_width_px  = s["lane_width"]
+    roi_w       = x_end - x_start
+    mid_x       = roi_w // 2
+    min_area    = s["min_contour_area"]
+    lane_width_px = s["lane_width"]
 
-    # Classify contours into left/right zones by centroid x
+    # Classify contours into left/right by centroid relative to ROI center
     left_cx, right_cx = None, None
     left_cy, right_cy = None, None
     best_left_area, best_right_area = 0, 0
@@ -236,16 +204,15 @@ def process_frame(frame, s, annotate: bool):
         M = cv2.moments(cnt)
         if M["m00"] <= 0:
             continue
-        
-        # Map ROI coords back to full frame coords
-        cx = int(M["m10"] / M["m00"]) + x_start
+
+        cx = int(M["m10"] / M["m00"])   # relative to ROI crop
         cy = int(M["m01"] / M["m00"])
 
-        if cx < left_boundary and area > best_left_area:
-            left_cx, left_cy = cx, cy
+        if cx < mid_x and area > best_left_area:
+            left_cx, left_cy = cx + x_start, cy     # map back to full frame
             best_left_area = area
-        elif cx > right_boundary and area > best_right_area:
-            right_cx, right_cy = cx, cy
+        elif cx >= mid_x and area > best_right_area:
+            right_cx, right_cy = cx + x_start, cy
             best_right_area = area
 
     # --- Compute lane center ---
@@ -254,41 +221,44 @@ def process_frame(frame, s, annotate: bool):
     lane_found = l_det or r_det
 
     if l_det and r_det:
+        # Both lines → midpoint is lane center
         lane_center = (left_cx + right_cx) // 2
     elif l_det:
+        # Only left line → infer center from lane width
         lane_center = left_cx + lane_width_px // 2
     elif r_det:
+        # Only right line → infer center from lane width
         lane_center = right_cx - lane_width_px // 2
     else:
-        lane_center = w // 2   # fallback — error will use memory below
+        lane_center = w // 2   # fallback (won't be used for error)
 
-    # --- Error ---
+    # --- Error & steering ---
     if lane_found:
-        error = (lane_center - w // 2) / (w // 2)
-        _last_good_error = error
-        _lost_count = 0
+        error = (lane_center - w // 2) / (w // 2) * 2   # ×2 gain
+
+        # --- PID ---
+        now = time.time()
+        dt  = max(now - pid_state["last_time"], 0.001)
+        pid_state["integral"]  += error * dt
+        pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
+        derivative              = (error - pid_state["last_error"]) / dt
+        pid_state["last_error"] = error
+        pid_state["last_time"]  = now
+
+        steer = (s["kp"] * error
+               + s["ki"] * pid_state["integral"]
+               + s["kd"] * derivative)
+        steer = max(-1.0, min(1.0, steer))
+        _last_steer = steer
     else:
-        # Lane lost — steer in the last known direction with recovery multiplier
-        _lost_count += 1
-        error = _last_good_error * s["recovery_steer"]
+        # Both lines lost → hold last steer
+        error = 0.0
+        steer = _last_steer
 
-    # --- PID ---
-    now = time.time()
-    dt  = max(now - pid_state["last_time"], 0.001)
-    pid_state["integral"]  += error * dt
-    pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
-    derivative              = (error - pid_state["last_error"]) / dt
-    pid_state["last_error"] = error
-    pid_state["last_time"]  = now
-
-    steer = (s["kp"] * error
-           + s["ki"] * pid_state["integral"]
-           + s["kd"] * derivative)
-    steer = max(-1.0, min(1.0, steer))
-
-    # --- Annotate only when a browser is watching ---
+    # --- Annotate ---
     if annotate:
         annotated = frame.copy()
+
         # ROI boundary line
         cv2.line(annotated, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
 
@@ -296,38 +266,23 @@ def process_frame(frame, s, annotate: bool):
         cv2.line(annotated, (x_start, roi_top), (x_start, h), (255, 0, 255), 1)
         cv2.line(annotated, (x_end, roi_top), (x_end, h), (255, 0, 255), 1)
 
-        # Zone boundaries (faint vertical lines)
-        cv2.line(annotated, (left_boundary, roi_top), (left_boundary, h), (100, 100, 100), 1)
-        cv2.line(annotated, (right_boundary, roi_top), (right_boundary, h), (100, 100, 100), 1)
-
         # Mask overlay
         mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         mask_3ch[:, :, 0] = 0
         annotated[roi_top:h, x_start:x_end] = cv2.addWeighted(
             annotated[roi_top:h, x_start:x_end], 0.7, mask_3ch, 0.3, 0)
 
-        cy_mid = roi_top + (h - roi_top) // 2
-
-        # Left lane marker
+        # Lane markers
         if l_det:
             cv2.circle(annotated, (left_cx, roi_top + left_cy), 8, (0, 255, 0), -1)
             cv2.circle(annotated, (left_cx, roi_top + left_cy), 8, (255, 255, 255), 2)
-        elif r_det:
-            # Ghost marker for inferred left position
-            inferred_lx = right_cx - lane_width_px
-            cv2.circle(annotated, (max(0, inferred_lx), cy_mid), 6, (0, 0, 200), 2)
-
-        # Right lane marker
         if r_det:
             cv2.circle(annotated, (right_cx, roi_top + right_cy), 8, (0, 255, 0), -1)
             cv2.circle(annotated, (right_cx, roi_top + right_cy), 8, (255, 255, 255), 2)
-        elif l_det:
-            # Ghost marker for inferred right position
-            inferred_rx = left_cx + lane_width_px
-            cv2.circle(annotated, (min(w - 1, inferred_rx), cy_mid), 6, (0, 0, 200), 2)
 
         # Lane center marker (cyan)
         if lane_found:
+            cy_mid = roi_top + (h - roi_top) // 2
             cv2.circle(annotated, (lane_center, cy_mid), 6, (255, 200, 0), -1)
 
         # Frame center line
@@ -345,21 +300,13 @@ def process_frame(frame, s, annotate: bool):
         cv2.putText(annotated, f"e{error:+.2f} s{steer:+.2f}", (5, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
         cv2.putText(annotated, f"fps {s['fps']}", (5, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
 
-        # Lane detection indicators
-        l_tag = "L\u2713" if l_det else "L\u2717"
-        r_tag = "R\u2713" if r_det else "R\u2717"
-        l_col = (0, 220, 60) if l_det else (0, 60, 220)
-        r_col = (0, 220, 60) if r_det else (0, 60, 220)
-        cv2.putText(annotated, l_tag, (w - 60, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, l_col, 1)
-        cv2.putText(annotated, r_tag, (w - 30, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, r_col, 1)
+        lane_col = (0, 220, 60) if lane_found else (0, 60, 220)
+        cv2.putText(annotated, "OK" if lane_found else "NO", (w - 30, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, lane_col, 1)
 
-        if _lost_count > 0:
-            cv2.putText(annotated, f"LOST {_lost_count}", (w // 2 - 30, 52),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
     else:
         annotated = frame   # no copy needed
 
-    return annotated, error, steer, lane_found, l_det, r_det
+    return annotated, error, steer, lane_found
 
 
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
@@ -385,7 +332,6 @@ def control_loop(car: JetRacer):
             time.sleep(0.01)
             continue
 
-        # Ensure frame is 3D (BGR)
         if len(frame.shape) != 3:
             continue
 
@@ -398,35 +344,21 @@ def control_loop(car: JetRacer):
         with clients_lock:
             has_clients = stream_clients > 0
 
-        # Annotate only if someone is watching; encode every Nth frame
         do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
-        annotated, error, steer, lane_found, l_det, r_det = process_frame(frame, s_copy, do_annotate)
+        annotated, error, steer, lane_found = process_frame(frame, s_copy, do_annotate)
 
-        # Async encode (fire-and-forget)
         if do_annotate:
             _encode_pool.submit(_do_encode, annotated)
 
-        # FPS counter
         fps_counter += 1
         if time.time() - fps_time >= 1.0:
             with state_lock:
                 state["fps"] = fps_counter
             fps_counter, fps_time = 0, time.time()
 
-        # Drive
         if s_copy["enabled"]:
-            if lane_found:
-                car.steer(steer)
-                car.forward(s_copy["speed"])
-            elif _lost_count < MAX_LOST_FRAMES:
-                # Lane lost but within recovery window — steer using memory
-                car.steer(steer)
-                # Gradually reduce speed as we stay lost
-                decay = max(0.3, 1.0 - _lost_count / MAX_LOST_FRAMES)
-                car.forward(s_copy["speed"] * decay)
-            else:
-                # Lost for too long — full stop
-                car.stop()
+            car.steer(steer)
+            car.forward(s_copy["speed"])
         else:
             car.stop()
 
@@ -434,8 +366,6 @@ def control_loop(car: JetRacer):
             state["error"]      = round(error, 3)
             state["steer"]      = round(steer, 3)
             state["lane_found"] = lane_found
-            state["left_det"]   = l_det
-            state["right_det"]  = r_det
 
         frame_idx += 1
 
@@ -470,10 +400,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .stat { display: flex; flex-direction: column; }
   .stat-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
   .stat-lbl { font-size: .65rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
-  .lane-ind { display: inline-block; font-size: .85rem; font-weight: 700; padding: 2px 6px;
-              border-radius: 4px; margin-right: 4px; }
-  .lane-ok  { background: #0a3a2a; color: #00d4aa; }
-  .lane-no  { background: #3a1a1a; color: #ff4d4d; }
   .slider-row { display: flex; align-items: center; gap: .5rem; margin-bottom: .55rem; }
   .slider-row label { font-size: .7rem; color: var(--muted); width: 65px; flex-shrink: 0; }
   .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
@@ -494,7 +420,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>&#9675; JetRacer &#183; Dual-Lane Dashboard</h1>
+<h1>&#9675; JetRacer &#183; Lane Follow Dashboard</h1>
 <div class="grid">
   <div class="card">
     <h2>Camera feed (annotated)</h2>
@@ -503,13 +429,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat"><span class="stat-val" id="v-fps">0</span><span class="stat-lbl">fps</span></div>
       <div class="stat"><span class="stat-val" id="v-err">0.00</span><span class="stat-lbl">error</span></div>
       <div class="stat"><span class="stat-val" id="v-str">0.00</span><span class="stat-lbl">steer</span></div>
-      <div class="stat">
-        <span class="stat-val" id="v-lane">
-          <span id="v-left" class="lane-ind lane-no">L</span>
-          <span id="v-right" class="lane-ind lane-no">R</span>
-        </span>
-        <span class="stat-lbl">lanes</span>
-      </div>
+      <div class="stat"><span class="stat-val" id="v-lane">—</span><span class="stat-lbl">lane</span></div>
     </div>
     <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
@@ -552,13 +472,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="slider-row">
       <label>Side Crop</label>
-      <input type="range" id="roi_side_limit" min="0" max="0.45" value="0.30" step="0.01">
-      <span class="val" id="v-roi_side_limit">0.30</span>
-    </div>
-    <div class="slider-row">
-      <label>Recovery</label>
-      <input type="range" id="recovery_steer" min="0" max="1" value="0.6" step="0.05">
-      <span class="val" id="v-recovery_steer">0.60</span>
+      <input type="range" id="roi_side_limit" min="0" max="0.45" value="0.0" step="0.01">
+      <span class="val" id="v-roi_side_limit">0.0</span>
     </div>
     <div class="slider-row">
       <label>Min area</label>
@@ -601,7 +516,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 <script>
 const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","s_hi","v_lo","v_hi",
-                 "min_contour_area","lane_width","recovery_steer","roi_side_limit"];
+                 "min_contour_area","lane_width","roi_side_limit"];
 sliders.forEach(id => {
   const el = document.getElementById(id);
   const disp = document.getElementById("v-"+id);
@@ -610,7 +525,7 @@ sliders.forEach(id => {
     if (id === "speed") {
       disp.textContent = (v/100).toFixed(2);
       sendParam(id, v/100);
-    } else if (id === "recovery_steer" || id === "roi_side_limit") {
+    } else if (id === "roi_side_limit") {
       disp.textContent = v.toFixed(2);
       sendParam(id, v);
     } else {
@@ -635,12 +550,9 @@ async function poll() {
     document.getElementById("v-err").textContent  = d.error.toFixed(2);
     document.getElementById("v-str").textContent  = d.steer.toFixed(2);
 
-    const leftEl  = document.getElementById("v-left");
-    const rightEl = document.getElementById("v-right");
-    leftEl.className  = "lane-ind " + (d.left_det  ? "lane-ok" : "lane-no");
-    rightEl.className = "lane-ind " + (d.right_det ? "lane-ok" : "lane-no");
-    leftEl.textContent  = d.left_det  ? "L\u2713" : "L\u2717";
-    rightEl.textContent = d.right_det ? "R\u2713" : "R\u2717";
+    const laneEl = document.getElementById("v-lane");
+    laneEl.textContent = d.lane_found ? "✓" : "✗";
+    laneEl.style.color = d.lane_found ? "#00d4aa" : "#ff4d4d";
 
     const pct = (d.error + 1) / 2 * 100;
     const bar = document.getElementById("error-bar");
@@ -658,7 +570,6 @@ poll();
 @app.route("/")
 def index():
     return render_template_string(DASHBOARD_HTML)
-
 
 def generate_mjpeg():
     global stream_clients
@@ -678,7 +589,6 @@ def generate_mjpeg():
         with clients_lock:
             stream_clients -= 1
 
-
 @app.route("/video_feed")
 def video_feed():
     return Response(generate_mjpeg(),
@@ -689,8 +599,7 @@ def video_feed():
 def status():
     with state_lock:
         return jsonify({k: state[k] for k in
-                        ("fps", "error", "steer", "lane_found", "enabled",
-                         "left_det", "right_det")})
+                        ("fps", "error", "steer", "lane_found", "enabled")})
 
 
 @app.route("/set", methods=["POST"])
