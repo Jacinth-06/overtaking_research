@@ -194,10 +194,8 @@ def process_frame(frame, s, annotate: bool):
     lane_width_px = s["lane_width"]
 
     # Classify contours into left/right by centroid relative to ROI center
-    left_cx, right_cx = None, None
-    left_cy, right_cy = None, None
-    best_left_area, best_right_area = 0, 0
-
+    # 1. Gather all valid lines
+    valid_contours = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < min_area:
@@ -205,33 +203,54 @@ def process_frame(frame, s, annotate: bool):
         M = cv2.moments(cnt)
         if M["m00"] <= 0:
             continue
-
-        cx = int(M["m10"] / M["m00"])   # relative to ROI crop
+        cx = int(M["m10"] / M["m00"]) + x_start # absolute X mapping
         cy = int(M["m01"] / M["m00"])
+        valid_contours.append((area, cx, cy))
 
-        if cx < mid_x and area > best_left_area:
-            left_cx, left_cy = cx + x_start, cy     # map back to full frame
-            best_left_area = area
-        elif cx >= mid_x and area > best_right_area:
-            right_cx, right_cy = cx + x_start, cy
-            best_right_area = area
+    # 2. Sort by area (descending) to find the two most prominent lines
+    valid_contours.sort(key=lambda x: x[0], reverse=True)
+    top_lines = valid_contours[:2]
 
-    # --- Compute lane center ---
-    l_det = left_cx is not None
-    r_det = right_cx is not None
+    left_cx, right_cx, left_cy, right_cy = None, None, None, None
+
+    # Get the last known lane center to intelligently classify a single line
+    # (Defaults to center of screen if starting fresh)
+    last_center = pid_state.get("last_center", w // 2)
+
+    # 3. Smart Classification
+    if len(top_lines) == 2:
+        # If we see two lines, the one with the smaller X is definitively Left
+        top_lines.sort(key=lambda x: x[1])
+        _, left_cx, left_cy = top_lines[0]
+        _, right_cx, right_cy = top_lines[1]
+        
+    elif len(top_lines) == 1:
+        # If we only see ONE line, compare it to the LAST KNOWN center
+        _, cx, cy = top_lines[0]
+        
+        if cx < last_center:
+            # It is to the left of the lane center, so it must be the left line
+            left_cx, left_cy = cx, cy
+        else:
+            # It is to the right of the lane center, so it must be the right line
+            right_cx, right_cy = cx, cy
+
+    # 4. Compute lane center
+    l_det, r_det = left_cx is not None, right_cx is not None
     lane_found = l_det or r_det
 
     if l_det and r_det:
-        # Both lines → midpoint is lane center
         lane_center = (left_cx + right_cx) // 2
     elif l_det:
-        # Only left line → infer center from lane width
         lane_center = left_cx + lane_width_px // 2
     elif r_det:
-        # Only right line → infer center from lane width
         lane_center = right_cx - lane_width_px // 2
     else:
-        lane_center = w // 2   # fallback (won't be used for error)
+        lane_center = w // 2   # fallback
+
+    # 5. MEMORY UPDATE: Save this center for the next frame's logic
+    if lane_found:
+        pid_state["last_center"] = lane_center # fallback (won't be used for error)
 
     # Apply lane adjuster offset
     lane_center += s.get("lane_adjuster", 0)
