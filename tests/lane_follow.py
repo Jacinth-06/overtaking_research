@@ -56,9 +56,9 @@ MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = {
     "h_lo": 0,  "h_hi": 180,
-    "s_lo": 0,  "s_hi": 92,
-    "v_lo": 216,  "v_hi": 255,
-    "kp": 0.55,   "ki": 0.003,  "kd": 0.35,
+    "s_lo": 0,  "s_hi": 40,
+    "v_lo": 240,  "v_hi": 255,
+    "kp": 0.75,   "ki": 0.003,  "kd": 0.35,
     "speed": 0.46,
     "enabled": False,
     "min_contour_area": 300,
@@ -225,35 +225,49 @@ def process_frame(frame, s, annotate: bool):
         _, right_cx, right_cy = top_lines[1]
         
     elif len(top_lines) == 1:
-        # If we only see ONE line, compare it to the LAST KNOWN center
         _, cx, cy = top_lines[0]
         
-        if cx < last_center:
-            # It is to the left of the lane center, so it must be the left line
-            left_cx, left_cy = cx, cy
-        else:
-            # It is to the right of the lane center, so it must be the right line
+        # If we are steering hard LEFT, a single line is almost certainly the RIGHT (outer) line
+        if _last_steer < -0.2:
             right_cx, right_cy = cx, cy
+        # If we are steering hard RIGHT, a single line is likely the LEFT (outer) line
+        elif _last_steer > 0.2:
+            left_cx, left_cy = cx, cy
+        # Otherwise, fallback to your spatial check
+        else:
+            if cx < last_center:
+                left_cx, left_cy = cx, cy
+            else:
+                right_cx, right_cy = cx, cy
 
     # --- 4. Dynamic Lane Center Computation ---
     l_det, r_det = left_cx is not None, right_cx is not None
     lane_found = l_det or r_det
 
-    # DYNAMIC BIAS: The 'Pro' Way
-    # Instead of a fixed number, we shift the target based on _last_steer.
-    # If steering hard left (e.g., -0.8), we shift the target center further left.
-    # This keeps the car away from the 'outer' edge where your cream floor is.
-    dynamic_shift = _last_steer * 60  # Adjust 60 to change "hug" intensity
-    
+    # Determine turn direction
+    is_turning_left = _last_steer < -0.1
+    is_turning_right = _last_steer > 0.1
+
+    # --- Hug the Inner Line ---
     if l_det and r_det:
-        # Midpoint + our dynamic preference
-        lane_center = (left_cx + right_cx) // 2 + int(dynamic_shift)
+        if is_turning_left:
+            # Hug the Left line (Inner)
+            lane_center = left_cx + (lane_width_px // 4)
+        elif is_turning_right:
+            # Hug the Right line (Inner)
+            lane_center = right_cx - (lane_width_px // 4)
+        else:
+            lane_center = (left_cx + right_cx) // 2
+            
     elif l_det:
-        # If we only see the LEFT line, stay close to it (don't wander far right)
-        lane_center = left_cx + (lane_width_px // 3) 
+        # Only Left found: If we are turning left, stay close to it
+        offset = (lane_width_px // 4) if is_turning_left else (lane_width_px // 2)
+        lane_center = left_cx + offset
+        
     elif r_det:
-        # If we only see the RIGHT line, stay close to it (don't wander far left)
-        lane_center = right_cx - (lane_width_px // 3)
+        # Only Right found: If we are turning right, stay close to it
+        offset = (lane_width_px // 4) if is_turning_right else (lane_width_px // 2)
+        lane_center = right_cx - offset
     else:
         lane_center = w // 2
 
@@ -488,8 +502,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h2>PID gains</h2>
     <div class="slider-row">
       <label>Kp</label>
-      <input type="range" id="kp" min="0" max="1" value="0.55" step="0.01">
-      <span class="val" id="v-kp">0.55</span>
+      <input type="range" id="kp" min="0" max="1" value="0.75" step="0.01">
+      <span class="val" id="v-kp">0.75</span>
     </div>
     <div class="slider-row">
       <label>Ki</label>
@@ -542,13 +556,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="slider-row">
       <label>S hi</label>
-      <input type="range" id="s_hi" min="0" max="255" value="50" step="1">
-      <span class="val" id="v-s_hi">50</span>
+      <input type="range" id="s_hi" min="0" max="255" value="40" step="1">
+      <span class="val" id="v-s_hi">40</span>
     </div>
     <div class="slider-row">
       <label>V lo</label>
-      <input type="range" id="v_lo" min="0" max="255" value="200" step="1">
-      <span class="val" id="v-v_lo">200</span>
+      <input type="range" id="v_lo" min="0" max="255" value="240" step="1">
+      <span class="val" id="v-v_lo">240</span>
     </div>
     <div class="slider-row">
       <label>V hi</label>
