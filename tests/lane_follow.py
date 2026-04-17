@@ -56,14 +56,14 @@ MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = {
     "h_lo": 0,  "h_hi": 180,
-    "s_lo": 0,  "s_hi": 50,
-    "v_lo": 200,  "v_hi": 255,
+    "s_lo": 0,  "s_hi": 92,
+    "v_lo": 216,  "v_hi": 255,
     "kp": 0.55,   "ki": 0.003,  "kd": 0.25,
-    "speed": 0.15,
+    "speed": 0.46,
     "enabled": False,
     "min_contour_area": 300,
-    "lane_width": 200,             # expected pixel distance between lane lines
-    "lane_adjuster": 0,            # manual offset for lane center
+    "lane_width": 325,             # expected pixel distance between lane lines
+    "lane_adjuster": -155,            # manual offset for lane center
     "roi_side_limit": 0.0,
     # telemetry (read-only from browser)
     "error": 0.0,  "steer": 0.0,  "fps": 0,
