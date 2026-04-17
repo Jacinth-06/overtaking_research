@@ -1,13 +1,15 @@
 """
-lane_follow.py — Inner-line hugger for JetRacer (Jetson Nano 4 GB)
-Track: dark road, white lane lines, green inner island (VIT & ARC mat)
+lane_follow.py — GPU-accelerated dual-lane follower + Flask dashboard
+Optimised for Jetson Nano 4 GB, black road with white lines on both sides.
 
-Core philosophy:
-  • Always identify the INNER white line (closest to green center).
-  • Drive at a fixed pixel offset FROM that inner line toward the road center.
-  • BOTH lines visible  → inner = the one geometrically closer to frame center.
-  • ONE line visible    → classify by screen position; apply offset accordingly.
-  • NO lines visible    → hold last steer, reduce speed.
+Detection strategy:
+  • HSV mask isolates white lane lines.
+  • ROI split into left zone / right zone.
+  • Largest contour in each zone → left_cx, right_cx.
+  • Both found → lane center = midpoint.
+  • One found  → lane center = inferred from detected line + lane_width.
+  • None found → hold last steer value until lane is found again.
+  • Error gain multiplied by 2 for sharper response.
 
 Run:   python lane_follow.py
 Open:  http://<jetson-ip>:5000
@@ -23,133 +25,177 @@ from flask import Flask, Response, render_template_string, request, jsonify
 from jetracer import JetRacer
 
 import os
-os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
-os.environ["OPENCV_VIDEOIO_PRIORITY_FFMPEG"] = "0"
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"        # Disable MSMF (Windows)
+# GStreamer MUST stay enabled — CSI camera outputs raw Bayer (RG10)
+# and needs nvarguscamerasrc for ISP debayering
+os.environ["OPENCV_VIDEOIO_PRIORITY_FFMPEG"] = "0"      # Disable FFMPEG
 
 app = Flask(__name__)
 
-# ── CUDA check ────────────────────────────────────────────────────────────────
+# ── CUDA availability check ───────────────────────────────────────────────────
 USE_CUDA = cv2.cuda.getCudaEnabledDeviceCount() > 0
-print(f"[init] {'CUDA active' if USE_CUDA else 'CPU fallback'}")
-_gpu_frame = cv2.cuda_GpuMat() if USE_CUDA else None
-_gpu_hsv   = cv2.cuda_GpuMat() if USE_CUDA else None
+if USE_CUDA:
+    print("[init] CUDA device found — GPU path active")
+    _gpu_frame = cv2.cuda_GpuMat()
+    _gpu_hsv   = cv2.cuda_GpuMat()
+    _gpu_mask  = cv2.cuda_GpuMat()
+else:
+    print("[init] No CUDA device — falling back to CPU")
+    _gpu_frame = _gpu_hsv = _gpu_mask = None
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-WIDTH, HEIGHT  = 320, 240
-ROI_FRAC       = 0.60       # use bottom 40 % of frame
-ENCODE_EVERY   = 3
-JPEG_QUALITY   = 30
-MJPEG_INTERVAL = 1 / 15
-MORPH_KERNEL   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+# ── Config constants ──────────────────────────────────────────────────────────
+WIDTH, HEIGHT   = 320, 240          # lower res = less GPU/CPU work
+ENCODE_EVERY    = 3                  # encode JPEG only every Nth frame
+JPEG_QUALITY    = 30                 # lower = smaller payload, less CPU
+MJPEG_INTERVAL  = 1 / 15            # 15 fps to browser
+ROI_FRAC        = 0.65              # bottom 35% used as ROI
+
+# Pre-allocate morphological kernel (constant — no need to recreate per frame)
+MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = {
-    # HSV thresholds for white line detection
-    "h_lo": 0,   "h_hi": 180,
-    "s_lo": 0,   "s_hi": 50,
-    "v_lo": 200, "v_hi": 255,
-
-    # PID
-    "kp": 0.70, "ki": 0.002, "kd": 0.30,
-
-    # Drive
-    "speed": 0.45,
+    "h_lo": 0,  "h_hi": 180,
+    "s_lo": 0,  "s_hi": 40,
+    "v_lo": 240,  "v_hi": 255,
+    "kp": 0.75,   "ki": 0.003,  "kd": 0.35,
+    "speed": 0.46,
     "enabled": False,
-
-    # Lane geometry
-    "lane_width": 300,      # expected pixel distance outer→inner line
-    "inner_offset": 60,     # pixels to stay away from inner line (into road)
-    "min_contour_area": 400,
-
-    # Telemetry (written by control loop, read by /status)
-    "error": 0.0,
-    "steer": 0.0,
-    "fps": 0,
-    "lane_state": "NONE",   # BOTH-IL | BOTH-IR | SINGLE-IL | SINGLE-IR | NONE
+    "min_contour_area": 300,
+    "lane_width": 325,             # expected pixel distance between lane lines
+    "lane_adjuster": 0,            # manual offset for lane center
+    "roi_side_limit": 0.0,
+    # telemetry (read-only from browser)
+    "error": 0.0,  "steer": 0.0,  "fps": 0,
+    "lane_found": False,
 }
 
-pid_state = {
-    "integral":   0.0,
-    "last_error": 0.0,
-    "last_time":  time.time(),
-    "last_steer": 0.0,
-}
+pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
 state_lock = threading.Lock()
 
+_last_steer = 0.0
+
+# Latest JPEG bytes for MJPEG stream
 frame_lock   = threading.Lock()
 latest_frame = None
-stream_clients   = 0
-clients_lock = threading.Lock()
+
+# Count of active MJPEG clients — skip annotation when 0
+stream_clients = 0
+clients_lock   = threading.Lock()
+
+# Async JPEG encoder (1 worker is enough; encoding is sequential)
 _encode_pool = ThreadPoolExecutor(max_workers=1)
 
 
 # ── Camera ────────────────────────────────────────────────────────────────────
-def _gst_pipeline(sensor_id=0, cap_w=1280, cap_h=720,
-                  disp_w=WIDTH, disp_h=HEIGHT, fps=60, flip=0):
+def _gstreamer_pipeline(
+    sensor_id=0,
+    capture_width=1280, capture_height=720,
+    display_width=WIDTH, display_height=HEIGHT,
+    framerate=60, flip_method=0,
+):
+    """
+    Build a GStreamer pipeline string for nvarguscamerasrc (Jetson CSI cameras).
+    """
     return (
         f"nvarguscamerasrc sensor-id={sensor_id} ! "
-        f"video/x-raw(memory:NVMM), width={cap_w}, height={cap_h}, "
-        f"framerate={fps}/1, format=NV12 ! "
-        f"nvvidconv flip-method={flip} ! "
-        f"video/x-raw, width={disp_w}, height={disp_h}, format=BGRx ! "
-        f"videoconvert ! video/x-raw, format=BGR ! "
+        f"video/x-raw(memory:NVMM), "
+        f"width=(int){capture_width}, height=(int){capture_height}, "
+        f"framerate=(fraction){framerate}/1, format=(string)NV12 ! "
+        f"nvvidconv flip-method={flip_method} ! "
+        f"video/x-raw, width=(int){display_width}, height=(int){display_height}, "
+        f"format=(string)BGRx ! "
+        f"videoconvert ! "
+        f"video/x-raw, format=(string)BGR ! "
         f"appsink drop=1 max-buffers=1"
     )
 
 def open_camera():
-    cap = cv2.VideoCapture(_gst_pipeline(), cv2.CAP_GSTREAMER)
+    # --- Try CSI camera via GStreamer (nvarguscamerasrc) ---
+    gst = _gstreamer_pipeline()
+    print(f"[camera] Trying GStreamer pipeline:\n  {gst}")
+    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
     if cap.isOpened():
-        print(f"[camera] CSI {WIDTH}×{HEIGHT} OK")
+        print(f"[camera] CSI camera via nvarguscamerasrc {WIDTH}×{HEIGHT} OK")
         return cap
-    print("[camera] GStreamer failed → USB fallback")
+    print("[camera] GStreamer pipeline failed, trying USB fallback...")
+
+    # --- Fallback: USB camera ---
     cap = cv2.VideoCapture(0)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        print(f"[camera] USB {WIDTH}×{HEIGHT} OK")
+        print(f"[camera] USB /dev/video0 {WIDTH}×{HEIGHT} OK")
         return cap
+
     raise RuntimeError("No camera found (CSI and USB both failed)")
 
 
-# ── HSV masking (GPU or CPU) ──────────────────────────────────────────────────
-def _build_gpu_mask_fn():
+# ── GPU HSV mask ──────────────────────────────────────────────────────────────
+def _make_gpu_hsv_mask():
     probe = cv2.cuda_GpuMat()
     probe.upload(np.zeros((1, 1, 3), dtype=np.uint8))
     try:
         result = cv2.cuda.cvtColor(probe, cv2.COLOR_BGR2HSV)
         if result is not None and not result.empty():
-            def fn(roi, lo, hi):
-                _gpu_frame.upload(roi)
-                hsv = cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV).download()
-                return cv2.inRange(hsv, lo, hi)
-            return fn
+            print("[cuda] cvtColor: functional API (returns GpuMat)")
+            def _mask_functional(roi_bgr, lo, hi):
+                _gpu_frame.upload(roi_bgr)
+                hsv_gpu = cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV)
+                hsv_cpu = hsv_gpu.download()
+                return cv2.inRange(hsv_cpu, lo, hi)
+            return _mask_functional
     except Exception:
         pass
-    # fallback in-place API
-    def fn(roi, lo, hi):
-        _gpu_frame.upload(roi)
+
+    print("[cuda] cvtColor: in-place API (dst arg)")
+    def _mask_inplace(roi_bgr, lo, hi):
+        _gpu_frame.upload(roi_bgr)
         cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV, _gpu_hsv)
-        return cv2.inRange(_gpu_hsv.download(), lo, hi)
-    return fn
+        hsv_cpu = _gpu_hsv.download()
+        return cv2.inRange(hsv_cpu, lo, hi)
+    return _mask_inplace
 
-_gpu_mask_fn = _build_gpu_mask_fn() if USE_CUDA else None
-
-def get_white_mask(roi, lo, hi):
-    if _gpu_mask_fn:
-        return _gpu_mask_fn(roi, lo, hi)
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+def cpu_hsv_mask(roi_bgr, lo, hi):
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     return cv2.inRange(hsv, lo, hi)
 
+gpu_hsv_mask = _make_gpu_hsv_mask() if USE_CUDA else None
 
-# ── Line detection ────────────────────────────────────────────────────────────
-def find_line_centroids(mask, min_area):
-    """
-    Return list of (cx, cy, area) for valid white blobs in mask,
-    sorted left-to-right by cx.
-    """
+
+# ── Dual-lane detection + PID ─────────────────────────────────────────────────
+def process_frame(frame, s, annotate: bool):
+    global _last_steer
+    h, w = frame.shape[:2]
+    roi_top = int(h * ROI_FRAC)
+
+    # Horizontal ROI cropping
+    x_start = int(w * s["roi_side_limit"])
+    x_end   = w - x_start
+    roi = frame[roi_top:h, x_start:x_end]
+
+    lo = np.array([s["h_lo"], s["s_lo"], s["v_lo"]], dtype=np.uint8)
+    hi = np.array([s["h_hi"], s["s_hi"], s["v_hi"]], dtype=np.uint8)
+
+    # --- Mask: GPU or CPU ---
+    mask = gpu_hsv_mask(roi, lo, hi) if gpu_hsv_mask is not None else cpu_hsv_mask(roi, lo, hi)
+
+    # --- Morphological cleanup (cached kernel) ---
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  MORPH_KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
+
+    # --- Contours ---
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    lines = []
+
+    roi_w       = x_end - x_start
+    mid_x       = roi_w // 2
+    min_area    = s["min_contour_area"]
+    lane_width_px = s["lane_width"]
+
+    # Classify contours into left/right by centroid relative to ROI center
+    # 1. Gather all valid lines
+    valid_contours = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area < min_area:
@@ -157,207 +203,174 @@ def find_line_centroids(mask, min_area):
         M = cv2.moments(cnt)
         if M["m00"] <= 0:
             continue
-        cx = int(M["m10"] / M["m00"])
+        cx = int(M["m10"] / M["m00"]) + x_start # absolute X mapping
         cy = int(M["m01"] / M["m00"])
-        lines.append((cx, cy, area))
-    lines.sort(key=lambda x: x[0])
-    return lines
+        valid_contours.append((area, cx, cy))
 
+    # 2. Sort by area (descending) to find the two most prominent lines
+    valid_contours.sort(key=lambda x: x[0], reverse=True)
+    top_lines = valid_contours[:2]
 
-def pick_best_left_right(lines):
-    """
-    Split blobs into left-of-center and right-of-center pools.
-    Return the largest blob from each pool as (cx, cy) or None.
-    """
-    mid = WIDTH // 2
-    left_pool  = [(cx, cy, a) for cx, cy, a in lines if cx <  mid]
-    right_pool = [(cx, cy, a) for cx, cy, a in lines if cx >= mid]
+    left_cx, right_cx, left_cy, right_cy = None, None, None, None
 
-    left  = max(left_pool,  key=lambda x: x[2])[:2] if left_pool  else None
-    right = max(right_pool, key=lambda x: x[2])[:2] if right_pool else None
-    return left, right          # each is (cx, cy) or None
+    # Get the last known lane center to intelligently classify a single line
+    # (Defaults to center of screen if starting fresh)
+    last_center = pid_state.get("last_center", w // 2)
 
-
-# ── Core processing ───────────────────────────────────────────────────────────
-def process_frame(frame, s, annotate: bool):
-    """
-    Detect white lines in ROI.
-    Always compute a target_x that is offset_px AWAY from the inner line
-    toward the road centre.  Feed into PID to produce a steer value.
-    """
-    h, w = frame.shape[:2]
-    roi_top = int(h * ROI_FRAC)
-    roi = frame[roi_top:h, :]
-
-    lo = np.array([s["h_lo"], s["s_lo"], s["v_lo"]], dtype=np.uint8)
-    hi = np.array([s["h_hi"], s["s_hi"], s["v_hi"]], dtype=np.uint8)
-
-    # White mask + morphology
-    mask = get_white_mask(roi, lo, hi)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  MORPH_KERNEL)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
-
-    lines       = find_line_centroids(mask, s["min_contour_area"])
-    left, right = pick_best_left_right(lines)
-
-    offset_px = s["inner_offset"]
-    cx_mid    = w // 2
-
-    # ── Identify inner line and set target_x ──────────────────────────────────
-    #
-    # On this oval track the green island is always at the CENTER.
-    # The inner white line is therefore always CLOSER to the frame center than
-    # the outer white line.
-    #
-    # "Hug inner" means:
-    #   • inner line is to the LEFT  → target = inner_cx + offset  (stay just right of it)
-    #   • inner line is to the RIGHT → target = inner_cx - offset  (stay just left of it)
-
-    if left and right:
-        left_cx,  left_cy  = left
-        right_cx, right_cy = right
-
-        dist_left  = abs(left_cx  - cx_mid)
-        dist_right = abs(right_cx - cx_mid)
-
-        if dist_left < dist_right:
-            # Left line is INNER (closer to center)
-            inner_cx, inner_cy = left_cx,  left_cy
-            target_x   = inner_cx + offset_px   # stay right of inner-left line
-            lane_state = "BOTH-IL"
+    # 3. Smart Classification
+    if len(top_lines) == 2:
+        # If we see two lines, the one with the smaller X is definitively Left
+        top_lines.sort(key=lambda x: x[1])
+        _, left_cx, left_cy = top_lines[0]
+        _, right_cx, right_cy = top_lines[1]
+        
+    elif len(top_lines) == 1:
+        _, cx, cy = top_lines[0]
+        
+        # FIX: If steering RIGHT (positive), we are likely hugging the RIGHT inner line
+        if _last_steer > 0.1: 
+            right_cx, right_cy = cx, cy
+            left_cx = None
+        # If steering LEFT (negative), we are likely hugging the LEFT inner line
+        elif _last_steer < -0.1:
+            left_cx, left_cy = cx, cy
+            right_cx = None
         else:
-            # Right line is INNER
-            inner_cx, inner_cy = right_cx, right_cy
-            target_x   = inner_cx - offset_px   # stay left of inner-right line
-            lane_state = "BOTH-IR"
+            # Fallback spatial check
+            if cx < last_center:
+                left_cx, left_cy = cx, cy
+            else:
+                right_cx, right_cy = cx, cy
 
-        inner_pt = (inner_cx, inner_cy)
+    # --- 4. Dynamic Lane Center Computation ---
+    l_det, r_det = left_cx is not None, right_cx is not None
+    lane_found = l_det or r_det
 
-    elif left:
-        left_cx, left_cy = left
-        inner_pt = (left_cx, left_cy)
-        if left_cx >= cx_mid:
-            # Blob is on the right half → inner right line
-            target_x   = left_cx - offset_px
-            lane_state = "SINGLE-IR"
+    # Determine turn direction
+    is_turning_left = _last_steer < -0.1
+    is_turning_right = _last_steer > 0.1
+
+    # --- Hug the Inner Line ---
+    if l_det and r_det:
+        if is_turning_left:
+            # Hug the Left line (Inner)
+            lane_center = left_cx + (lane_width_px // 4)
+        elif is_turning_right:
+            # Hug the Right line (Inner)
+            lane_center = right_cx - (lane_width_px // 4)
         else:
-            # Blob is on the left half → inner left line
-            target_x   = left_cx + offset_px
-            lane_state = "SINGLE-IL"
-
-    elif right:
-        right_cx, right_cy = right
-        inner_pt = (right_cx, right_cy)
-        if right_cx < cx_mid:
-            # Blob is on the left half → inner left line
-            target_x   = right_cx + offset_px
-            lane_state = "SINGLE-IL"
-        else:
-            # Blob is on the right half → inner right line
-            target_x   = right_cx - offset_px
-            lane_state = "SINGLE-IR"
-
+            lane_center = (left_cx + right_cx) // 2
+            
+    elif l_det:
+        # Only Left found: If we are turning left, stay close to it
+        offset = (lane_width_px // 4) if is_turning_left else (lane_width_px // 2)
+        lane_center = left_cx + offset
+        
+    elif r_det:
+        # Only Right found: If we are turning right, stay close to it
+        offset = (lane_width_px // 4) if is_turning_right else (lane_width_px // 2)
+        lane_center = right_cx - offset
     else:
-        inner_pt   = None
-        target_x   = cx_mid      # dummy
-        lane_state = "NONE"
+        lane_center = w // 2
 
-    # Clamp target_x to frame bounds
-    target_x = max(0, min(w - 1, target_x))
+    # Manual adjuster now ONLY used for physical camera misalignment
+    lane_center += s.get("lane_adjuster", 0)
 
-    # ── PID ───────────────────────────────────────────────────────────────────
-    lane_found = lane_state != "NONE"
+    # --- Update Lane Width Memory (Auto-Learning) ---
+    if l_det and r_det:
+        current_width = right_cx - left_cx
+        # Use a slow rolling average (95% old, 5% new)
+        with state_lock:
+            state["lane_width"] = int(state["lane_width"] * 0.95 + current_width * 0.05)
 
+    # --- Error & steering ---
     if lane_found:
-        # error: positive = target is right of centre → steer right
-        error = (target_x - cx_mid) / cx_mid
-        error = max(-1.0, min(1.0, error))
-
+        # Normalise error (-1.0 to 1.0)
+        error = (lane_center - w // 2) / (w // 2)
+        
+        # --- PID ---
         now = time.time()
         dt  = max(now - pid_state["last_time"], 0.001)
-
-        pid_state["integral"] += error * dt
-        pid_state["integral"]  = max(-1.0, min(1.0, pid_state["integral"]))
-        derivative             = (error - pid_state["last_error"]) / dt
-
+        pid_state["integral"]  += error * dt
+        pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
+        derivative              = (error - pid_state["last_error"]) / dt
+        
         pid_state["last_error"] = error
         pid_state["last_time"]  = now
+        pid_state["last_center"] = lane_center
 
         steer = (s["kp"] * error
                + s["ki"] * pid_state["integral"]
                + s["kd"] * derivative)
         steer = max(-1.0, min(1.0, steer))
-        pid_state["last_steer"] = steer
-
+        _last_steer = steer
     else:
+        # Lost lines -> hold last steer
         error = 0.0
-        steer = pid_state["last_steer"]   # hold last known steer
+        steer = _last_steer
 
-    # ── Annotation ────────────────────────────────────────────────────────────
+    # --- Annotate ---
     if annotate:
-        vis = frame.copy()
+        annotated = frame.copy()
 
-        # ROI boundary
-        cv2.line(vis, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
+        # ROI boundary line
+        cv2.line(annotated, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
 
-        # Mask overlay (green tint in ROI)
+        # Horizontal crop lines
+        cv2.line(annotated, (x_start, roi_top), (x_start, h), (255, 0, 255), 1)
+        cv2.line(annotated, (x_end, roi_top), (x_end, h), (255, 0, 255), 1)
+
+        # Mask overlay
         mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        mask_3ch[:, :, [0, 2]] = 0
-        vis[roi_top:h] = cv2.addWeighted(vis[roi_top:h], 0.7, mask_3ch, 0.3, 0)
+        mask_3ch[:, :, 0] = 0
+        annotated[roi_top:h, x_start:x_end] = cv2.addWeighted(
+            annotated[roi_top:h, x_start:x_end], 0.7, mask_3ch, 0.3, 0)
 
-        # Left blob → blue dot, right blob → orange dot
-        if left:
-            cv2.circle(vis, (left[0],  roi_top + left[1]),  9, (255, 80,  0),   -1)
-            cv2.circle(vis, (left[0],  roi_top + left[1]),  9, (255,255,255),    2)
-        if right:
-            cv2.circle(vis, (right[0], roi_top + right[1]), 9, (0,   80, 255),  -1)
-            cv2.circle(vis, (right[0], roi_top + right[1]), 9, (255,255,255),    2)
+        # Lane markers
+        if l_det:
+            cv2.circle(annotated, (left_cx, roi_top + left_cy), 8, (0, 255, 0), -1)
+            cv2.circle(annotated, (left_cx, roi_top + left_cy), 8, (255, 255, 255), 2)
+        if r_det:
+            cv2.circle(annotated, (right_cx, roi_top + right_cy), 8, (0, 255, 0), -1)
+            cv2.circle(annotated, (right_cx, roi_top + right_cy), 8, (255, 255, 255), 2)
 
-        # Inner line (diamond marker)
-        if inner_pt:
-            ix = inner_pt[0]
-            iy = roi_top + inner_pt[1]
-            pts = np.array([[ix, iy-10],[ix+7,iy],[ix,iy+10],[ix-7,iy]], np.int32)
-            cv2.fillPoly(vis, [pts], (0, 230, 120))
-            cv2.polylines(vis, [pts], True, (255,255,255), 1)
-
-        # Target X line (cyan)
+        # Lane center marker (cyan)
         if lane_found:
             cy_mid = roi_top + (h - roi_top) // 2
-            cv2.line(vis, (target_x, roi_top), (target_x, h), (0, 220, 220), 1)
-            cv2.circle(vis, (target_x, cy_mid), 6, (0, 220, 220), -1)
+            cv2.circle(annotated, (lane_center, cy_mid), 6, (255, 200, 0), -1)
 
-        # Frame centre line (grey)
-        cv2.line(vis, (cx_mid, roi_top), (cx_mid, h), (80, 80, 80), 1)
+        # Frame center line
+        cv2.line(annotated, (w // 2, roi_top), (w // 2, h), (0, 200, 255), 1)
 
-        # Steer arrow at top
-        arrow_x = int(cx_mid + steer * (w // 3))
-        cv2.arrowedLine(vis, (cx_mid, 22), (arrow_x, 22), (0, 160, 255), 2, tipLength=0.35)
+        # Steer arrow
+        arrow_x = int(w // 2 + steer * (w // 3))
+        cv2.arrowedLine(annotated, (w // 2, 22), (arrow_x, 22),
+                        (0, 140, 255), 2, tipLength=0.35)
 
-        # Text
-        status = "DRIVE" if s["enabled"] else "STOP"
-        col    = (0, 220, 60) if s["enabled"] else (60, 60, 220)
-        cv2.putText(vis, status, (5, 18),  cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
-        cv2.putText(vis, f"e{error:+.2f} s{steer:+.2f}", (5, 36),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.putText(vis, f"fps {s['fps']}", (5, 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 160, 160), 1)
-        lc = (0, 220, 60) if lane_found else (0, 60, 220)
-        cv2.putText(vis, lane_state, (w - 95, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, lc, 1)
+        # Status text
+        status = "DRIVING" if s["enabled"] else "STOPPED"
+        color  = (0, 220, 60) if s["enabled"] else (60, 60, 220)
+        cv2.putText(annotated, status, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(annotated, f"e{error:+.2f} s{steer:+.2f}", (5, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+        cv2.putText(annotated, f"fps {s['fps']}", (5, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+
+        lane_col = (0, 220, 60) if lane_found else (0, 60, 220)
+        cv2.putText(annotated, "OK" if lane_found else "NO", (w - 30, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, lane_col, 1)
+
     else:
-        vis = frame
+        annotated = frame   # no copy needed
 
-    return vis, error, steer, lane_state
+    return annotated, error, steer, lane_found
 
 
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
 def _do_encode(img):
     ret, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    if ret:
-        with frame_lock:
-            global latest_frame
-            latest_frame = jpeg.tobytes()
+    if not ret:
+        return
+    with frame_lock:
+        global latest_frame
+        latest_frame = jpeg.tobytes()
 
 
 # ── Control loop ──────────────────────────────────────────────────────────────
@@ -372,21 +385,24 @@ def control_loop(car: JetRacer):
         if not ret:
             time.sleep(0.01)
             continue
+
         if len(frame.shape) != 3:
             continue
+
         if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
             frame = cv2.resize(frame, (WIDTH, HEIGHT))
 
         with state_lock:
-            s = dict(state)
+            s_copy = dict(state)
 
         with clients_lock:
-            do_annotate = stream_clients > 0 and (frame_idx % ENCODE_EVERY == 0)
+            has_clients = stream_clients > 0
 
-        vis, error, steer, lane_state = process_frame(frame, s, do_annotate)
+        do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
+        annotated, error, steer, lane_found = process_frame(frame, s_copy, do_annotate)
 
         if do_annotate:
-            _encode_pool.submit(_do_encode, vis)
+            _encode_pool.submit(_do_encode, annotated)
 
         fps_counter += 1
         if time.time() - fps_time >= 1.0:
@@ -394,249 +410,215 @@ def control_loop(car: JetRacer):
                 state["fps"] = fps_counter
             fps_counter, fps_time = 0, time.time()
 
-        if s["enabled"]:
-            speed = s["speed"]
-            if lane_state == "NONE":
-                speed *= 0.5    # coast slowly when blind
+        if s_copy["enabled"]:
             car.steer(steer)
-            car.forward(speed)
+            car.forward(s_copy["speed"])
         else:
             car.stop()
 
         with state_lock:
             state["error"]      = round(error, 3)
             state["steer"]      = round(steer, 3)
-            state["lane_state"] = lane_state
+            state["lane_found"] = lane_found
 
         frame_idx += 1
 
     cap.release()
 
 
-# ── Dashboard HTML ────────────────────────────────────────────────────────────
+# ── Flask / dashboard ───────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JetRacer · Inner Line Hugger</title>
+<title>JetRacer Lane Follower</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;500&display=swap');
   :root {
-    --bg: #080c12; --surface: #0f1520; --surface2: #161e2e;
-    --border: #1e2d42; --accent: #00e5c0; --warn: #f5a623;
-    --danger: #ff3d5a; --text: #d8e4f0; --muted: #4d6680;
+    --bg: #0e1117; --surface: #161b27; --border: #2a3040;
+    --accent: #00d4aa; --warn: #ffb020; --danger: #ff4d4d;
+    --text: #e8ecf1; --muted: #6b7a99;
+    --font: 'JetBrains Mono', 'Fira Mono', monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg); color: var(--text);
-    font-family: 'DM Sans', sans-serif;
-    min-height: 100vh; padding: 1.25rem;
-    background-image:
-      radial-gradient(ellipse at 15% 0%, #001a2e55 0%, transparent 55%),
-      radial-gradient(ellipse at 85% 100%, #00e5c010 0%, transparent 55%);
-  }
-  header { display: flex; align-items: center; gap: .75rem; margin-bottom: 1.25rem; }
-  .pulse {
-    width: 9px; height: 9px; border-radius: 50%;
-    background: var(--accent); box-shadow: 0 0 10px var(--accent);
-    animation: blink 2s infinite;
-  }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
-  h1 { font-family:'Space Mono',monospace; font-size:.82rem;
-       letter-spacing:.22em; color:var(--accent); text-transform:uppercase; }
-
-  .grid { display:grid; grid-template-columns:1fr 310px; gap:1rem;
-          max-width:1060px; margin:0 auto; }
-  .card { background:var(--surface); border:1px solid var(--border);
-          border-radius:12px; padding:1rem; }
-  .card-title { font-family:'Space Mono',monospace; font-size:.58rem;
-                letter-spacing:.15em; color:var(--muted); text-transform:uppercase;
-                margin-bottom:.75rem; }
-
-  img#feed { width:100%; border-radius:8px; display:block;
-             background:#000; min-height:150px; border:1px solid var(--border); }
-
-  .stats { display:flex; gap:.75rem; flex-wrap:wrap; margin-top:.85rem; }
-  .stat { background:var(--surface2); border-radius:8px; padding:.45rem .7rem; min-width:60px; }
-  .stat-val { font-family:'Space Mono',monospace; font-size:1.2rem;
-              font-weight:700; color:var(--accent); line-height:1; }
-  .stat-lbl { font-size:.58rem; color:var(--muted); margin-top:2px;
-              text-transform:uppercase; letter-spacing:.08em; }
-
-  .err-track { position:relative; height:6px; background:var(--border);
-               border-radius:3px; margin-top:.85rem; overflow:hidden; }
-  #err-bar { position:absolute; height:100%; width:6px; background:var(--accent);
-             left:50%; transform:translateX(-50%);
-             transition:left .08s, background .2s; border-radius:3px; }
-  .err-track::after { content:''; position:absolute; left:50%; top:0;
-                      width:1px; height:100%; background:var(--muted);
-                      transform:translateX(-50%); }
-
-  .legend { display:flex; gap:.75rem; margin-top:.6rem; flex-wrap:wrap; }
-  .legend-item { display:flex; align-items:center; gap:.3rem;
-                 font-size:.62rem; color:var(--muted); }
-  .dot { width:8px; height:8px; border-radius:50%; }
-
-  .section-label { font-family:'Space Mono',monospace; font-size:.58rem;
-                   color:var(--muted); letter-spacing:.12em; text-transform:uppercase;
-                   margin:.85rem 0 .5rem; padding-bottom:.35rem;
-                   border-bottom:1px solid var(--border); }
-  .row { display:flex; align-items:center; gap:.5rem; margin-bottom:.42rem; }
-  .row label { font-size:.66rem; color:var(--muted); width:68px; flex-shrink:0; }
-  .row input[type=range] { flex:1; accent-color:var(--accent); cursor:pointer; }
-  .row .val { font-family:'Space Mono',monospace; font-size:.68rem;
-              width:46px; text-align:right; color:var(--text); }
-
-  .btn-row { display:flex; gap:.5rem; margin-top:.5rem; }
-  button { flex:1; padding:.55rem; border:none; border-radius:8px; cursor:pointer;
-           font-family:'Space Mono',monospace; font-size:.75rem; font-weight:700;
-           letter-spacing:.05em; transition:filter .15s, transform .1s; }
-  button:active { transform:scale(.97); }
-  #btn-go   { background:var(--accent); color:#021a14; }
-  #btn-stop { background:var(--danger); color:#fff; }
-  #btn-go:hover, #btn-stop:hover { filter:brightness(1.15); }
-
-  @media(max-width:700px){.grid{grid-template-columns:1fr}}
+  body { background: var(--bg); color: var(--text); font-family: var(--font);
+         display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 1rem; }
+  h1 { font-size: 1rem; letter-spacing: .15em; color: var(--accent);
+       text-transform: uppercase; margin-bottom: 1rem; }
+  .grid { display: grid; grid-template-columns: 1fr 340px; gap: 1rem; width: 100%; max-width: 1100px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; }
+  .card h2 { font-size: .7rem; letter-spacing: .12em; color: var(--muted); text-transform: uppercase;
+             margin-bottom: .75rem; }
+  img#feed { width: 100%; border-radius: 6px; display: block; background: #000; min-height: 180px; }
+  .status-bar { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: .75rem; }
+  .stat { display: flex; flex-direction: column; }
+  .stat-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
+  .stat-lbl { font-size: .65rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  .slider-row { display: flex; align-items: center; gap: .5rem; margin-bottom: .55rem; }
+  .slider-row label { font-size: .7rem; color: var(--muted); width: 65px; flex-shrink: 0; }
+  .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .slider-row .val { font-size: .75rem; width: 45px; text-align: right; color: var(--text); }
+  .btn-row { display: flex; gap: .5rem; margin-top: .75rem; }
+  button { padding: .45rem 1.1rem; border: none; border-radius: 6px; cursor: pointer;
+           font-family: var(--font); font-size: .8rem; font-weight: 600; letter-spacing: .04em; }
+  #btn-go   { background: var(--accent); color: #061612; }
+  #btn-stop { background: var(--danger); color: #fff; }
+  #btn-go:hover   { filter: brightness(1.1); }
+  #btn-stop:hover { filter: brightness(1.1); }
+  .error-track { position: relative; height: 18px; background: var(--border);
+                 border-radius: 9px; margin-top: .5rem; overflow: hidden; }
+  #error-bar { position: absolute; height: 100%; width: 4px; background: var(--accent);
+               left: 50%; transform: translateX(-50%); transition: left .1s; border-radius: 9px; }
+  .divider { border: none; border-top: 1px solid var(--border); margin: .75rem 0; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
-<header>
-  <div class="pulse"></div>
-  <h1>JetRacer &middot; Inner Line Hugger</h1>
-</header>
-
+<h1>&#9675; JetRacer &#183; Lane Follow Dashboard</h1>
 <div class="grid">
-  <!-- Camera card -->
   <div class="card">
-    <div class="card-title">Camera feed (annotated)</div>
-    <img id="feed" src="/video_feed" alt="feed">
-    <div class="stats">
-      <div class="stat"><div class="stat-val" id="v-fps">0</div><div class="stat-lbl">fps</div></div>
-      <div class="stat"><div class="stat-val" id="v-err">0.00</div><div class="stat-lbl">error</div></div>
-      <div class="stat"><div class="stat-val" id="v-str">0.00</div><div class="stat-lbl">steer</div></div>
-      <div class="stat"><div class="stat-val" id="v-lane" style="font-size:.8rem">—</div><div class="stat-lbl">lane</div></div>
+    <h2>Camera feed (annotated)</h2>
+    <img id="feed" src="/video_feed" alt="camera">
+    <div class="status-bar" style="margin-top:.75rem">
+      <div class="stat"><span class="stat-val" id="v-fps">0</span><span class="stat-lbl">fps</span></div>
+      <div class="stat"><span class="stat-val" id="v-err">0.00</span><span class="stat-lbl">error</span></div>
+      <div class="stat"><span class="stat-val" id="v-str">0.00</span><span class="stat-lbl">steer</span></div>
+      <div class="stat"><span class="stat-val" id="v-lane">—</span><span class="stat-lbl">lane</span></div>
     </div>
-    <div class="err-track" title="error: left=-1  centre=0  right=+1">
-      <div id="err-bar"></div>
-    </div>
-    <div class="legend">
-      <div class="legend-item"><div class="dot" style="background:#ff5020"></div>Left blob</div>
-      <div class="legend-item"><div class="dot" style="background:#0050ff"></div>Right blob</div>
-      <div class="legend-item"><div class="dot" style="background:#00e060"></div>Inner line</div>
-      <div class="legend-item"><div class="dot" style="background:#00e5c0"></div>Target</div>
+    <div class="error-track" title="Lane error (centre = 0)">
+      <div id="error-bar"></div>
     </div>
   </div>
-
-  <!-- Controls card -->
   <div class="card">
-    <div class="card-title">Controls</div>
-
-    <div class="section-label">Drive</div>
-    <div class="row">
+    <h2>Drive</h2>
+    <div class="slider-row">
       <label>Speed</label>
-      <input type="range" id="speed" min="0" max="70" value="45" step="1">
-      <span class="val" id="v-speed">0.45</span>
+      <input type="range" id="speed" min="0" max="60" value="46" step="1">
+      <span class="val" id="v-speed">0.46</span>
     </div>
     <div class="btn-row">
       <button id="btn-go"   onclick="setEnabled(true)">&#9654; GO</button>
       <button id="btn-stop" onclick="setEnabled(false)">&#9632; STOP</button>
     </div>
-
-    <div class="section-label">PID Gains</div>
-    <div class="row"><label>Kp</label>
-      <input type="range" id="kp" min="0" max="1.5" value="0.70" step="0.01">
-      <span class="val" id="v-kp">0.70</span></div>
-    <div class="row"><label>Ki</label>
-      <input type="range" id="ki" min="0" max="0.05" value="0.002" step="0.001">
-      <span class="val" id="v-ki">0.002</span></div>
-    <div class="row"><label>Kd</label>
-      <input type="range" id="kd" min="0" max="0.8" value="0.30" step="0.01">
-      <span class="val" id="v-kd">0.30</span></div>
-
-    <div class="section-label">Inner Hug</div>
-    <div class="row"><label>Offset px</label>
-      <input type="range" id="inner_offset" min="10" max="160" value="60" step="5">
-      <span class="val" id="v-inner_offset">60</span></div>
-    <div class="row"><label>Lane W px</label>
-      <input type="range" id="lane_width" min="50" max="500" value="300" step="5">
-      <span class="val" id="v-lane_width">300</span></div>
-    <div class="row"><label>Min area</label>
-      <input type="range" id="min_contour_area" min="50" max="3000" value="400" step="50">
-      <span class="val" id="v-min_contour_area">400</span></div>
-
-    <div class="section-label">HSV (white lines)</div>
-    <div class="row"><label>H lo</label>
+    <hr class="divider">
+    <h2>PID gains</h2>
+    <div class="slider-row">
+      <label>Kp</label>
+      <input type="range" id="kp" min="0" max="1" value="0.75" step="0.01">
+      <span class="val" id="v-kp">0.75</span>
+    </div>
+    <div class="slider-row">
+      <label>Ki</label>
+      <input type="range" id="ki" min="0" max="0.05" value="0.003" step="0.001">
+      <span class="val" id="v-ki">0.003</span>
+    </div>
+    <div class="slider-row">
+      <label>Kd</label>
+      <input type="range" id="kd" min="0" max="0.5" value="0.35" step="0.01">
+      <span class="val" id="v-kd">0.35</span>
+    </div>
+    <hr class="divider">
+    <h2>Lane detection</h2>
+    <div class="slider-row">
+      <label>Lane W</label>
+      <input type="range" id="lane_width" min="50" max="700" value="325" step="5">
+      <span class="val" id="v-lane_width">325</span>
+    </div>
+    <div class="slider-row">
+      <label>Adjuster</label>
+      <input type="range" id="lane_adjuster" min="-700" max="700" value="0" step="5">
+      <span class="val" id="v-lane_adjuster">0</span>
+    </div>
+    <div class="slider-row">
+      <label>Side Crop</label>
+      <input type="range" id="roi_side_limit" min="0" max="0.45" value="0.0" step="0.01">
+      <span class="val" id="v-roi_side_limit">0.0</span>
+    </div>
+    <div class="slider-row">
+      <label>Min area</label>
+      <input type="range" id="min_contour_area" min="50" max="5000" value="300" step="50">
+      <span class="val" id="v-min_contour_area">300</span>
+    </div>
+    <hr class="divider">
+    <h2>HSV mask</h2>
+    <div class="slider-row">
+      <label>H lo</label>
       <input type="range" id="h_lo" min="0" max="179" value="0" step="1">
-      <span class="val" id="v-h_lo">0</span></div>
-    <div class="row"><label>H hi</label>
+      <span class="val" id="v-h_lo">0</span>
+    </div>
+    <div class="slider-row">
+      <label>H hi</label>
       <input type="range" id="h_hi" min="0" max="179" value="180" step="1">
-      <span class="val" id="v-h_hi">180</span></div>
-    <div class="row"><label>S lo</label>
+      <span class="val" id="v-h_hi">180</span>
+    </div>
+    <div class="slider-row">
+      <label>S lo</label>
       <input type="range" id="s_lo" min="0" max="255" value="0" step="1">
-      <span class="val" id="v-s_lo">0</span></div>
-    <div class="row"><label>S hi</label>
-      <input type="range" id="s_hi" min="0" max="255" value="50" step="1">
-      <span class="val" id="v-s_hi">50</span></div>
-    <div class="row"><label>V lo</label>
-      <input type="range" id="v_lo" min="0" max="255" value="200" step="1">
-      <span class="val" id="v-v_lo">200</span></div>
-    <div class="row"><label>V hi</label>
+      <span class="val" id="v-s_lo">0</span>
+    </div>
+    <div class="slider-row">
+      <label>S hi</label>
+      <input type="range" id="s_hi" min="0" max="255" value="40" step="1">
+      <span class="val" id="v-s_hi">40</span>
+    </div>
+    <div class="slider-row">
+      <label>V lo</label>
+      <input type="range" id="v_lo" min="0" max="255" value="240" step="1">
+      <span class="val" id="v-v_lo">240</span>
+    </div>
+    <div class="slider-row">
+      <label>V hi</label>
       <input type="range" id="v_hi" min="0" max="255" value="255" step="1">
-      <span class="val" id="v-v_hi">255</span></div>
+      <span class="val" id="v-v_hi">255</span>
+    </div>
   </div>
 </div>
-
 <script>
-const PARAMS = [
-  {id:"speed",           fmt: v => (v/100).toFixed(2), tx: v => v/100},
-  {id:"kp",              fmt: v => v.toFixed(2)},
-  {id:"ki",              fmt: v => v.toFixed(3)},
-  {id:"kd",              fmt: v => v.toFixed(2)},
-  {id:"inner_offset",    fmt: v => parseInt(v)},
-  {id:"lane_width",      fmt: v => parseInt(v)},
-  {id:"min_contour_area",fmt: v => parseInt(v)},
-  {id:"h_lo"},{id:"h_hi"},{id:"s_lo"},{id:"s_hi"},{id:"v_lo"},{id:"v_hi"},
-];
-PARAMS.forEach(p => {
-  const el = document.getElementById(p.id);
-  const dv = document.getElementById("v-" + p.id);
-  if (!el) return;
+const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","s_hi","v_lo","v_hi",
+                 "min_contour_area","lane_width","lane_adjuster","roi_side_limit"];
+sliders.forEach(id => {
+  const el = document.getElementById(id);
+  const disp = document.getElementById("v-"+id);
   el.addEventListener("input", () => {
-    const raw = parseFloat(el.value);
-    dv.textContent = p.fmt ? p.fmt(raw) : raw;
-    const sv = p.tx ? p.tx(raw) : raw;
-    fetch("/set",{method:"POST",headers:{"Content-Type":"application/json"},
-                  body:JSON.stringify({[p.id]: parseFloat(sv)})});
+    const v = parseFloat(el.value);
+    if (id === "speed") {
+      disp.textContent = (v/100).toFixed(2);
+      sendParam(id, v/100);
+    } else if (id === "roi_side_limit") {
+      disp.textContent = v.toFixed(2);
+      sendParam(id, v);
+    } else {
+      disp.textContent = Number.isInteger(v) ? v : v.toFixed(3);
+      sendParam(id, v);
+    }
   });
 });
-function setEnabled(v){
-  fetch("/set",{method:"POST",headers:{"Content-Type":"application/json"},
-                body:JSON.stringify({enabled:v})});
+function sendParam(key, value) {
+  fetch("/set", {method:"POST", headers:{"Content-Type":"application/json"},
+                 body: JSON.stringify({[key]: value})});
 }
-const LANE_COLOR = {
-  "BOTH-IL":"#00e5c0","BOTH-IR":"#00e5c0",
-  "SINGLE-IL":"#f5a623","SINGLE-IR":"#f5a623","NONE":"#ff3d5a"
-};
-const LANE_SHORT = {
-  "BOTH-IL":"BOTH","BOTH-IR":"BOTH",
-  "SINGLE-IL":"SNGL","SINGLE-IR":"SNGL","NONE":"NONE"
-};
-async function poll(){
-  try{
-    const d = await (await fetch("/status")).json();
-    document.getElementById("v-fps").textContent = d.fps;
-    document.getElementById("v-err").textContent = d.error.toFixed(2);
-    document.getElementById("v-str").textContent = d.steer.toFixed(2);
-    const lel = document.getElementById("v-lane");
-    lel.textContent  = LANE_SHORT[d.lane_state] || d.lane_state;
-    lel.style.color  = LANE_COLOR[d.lane_state] || "#fff";
+function setEnabled(v) {
+  fetch("/set", {method:"POST", headers:{"Content-Type":"application/json"},
+                 body: JSON.stringify({enabled: v})});
+}
+async function poll() {
+  try {
+    const r = await fetch("/status");
+    const d = await r.json();
+    document.getElementById("v-fps").textContent  = d.fps;
+    document.getElementById("v-err").textContent  = d.error.toFixed(2);
+    document.getElementById("v-str").textContent  = d.steer.toFixed(2);
+
+    const laneEl = document.getElementById("v-lane");
+    laneEl.textContent = d.lane_found ? "✓" : "✗";
+    laneEl.style.color = d.lane_found ? "#00d4aa" : "#ff4d4d";
+
     const pct = (d.error + 1) / 2 * 100;
-    const bar = document.getElementById("err-bar");
-    bar.style.left       = pct + "%";
-    bar.style.background = Math.abs(d.error) > 0.6 ? "#ff3d5a" : "#00e5c0";
-  }catch(e){}
-  setTimeout(poll, 200);
+    const bar = document.getElementById("error-bar");
+    bar.style.left = pct + "%";
+    bar.style.background = Math.abs(d.error) > 0.5 ? "#ff4d4d" : "#00d4aa";
+  } catch(e) {}
+  setTimeout(poll, 250);
 }
 poll();
 </script>
@@ -644,23 +626,23 @@ poll();
 </html>"""
 
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template_string(DASHBOARD_HTML)
 
-def _generate_mjpeg():
+def generate_mjpeg():
     global stream_clients
     with clients_lock:
         stream_clients += 1
     try:
         while True:
             with frame_lock:
-                f = latest_frame
-            if f is None:
+                frame = latest_frame
+            if frame is None:
                 time.sleep(0.02)
                 continue
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + f + b"\r\n"
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
             time.sleep(MJPEG_INTERVAL)
     finally:
         with clients_lock:
@@ -668,14 +650,16 @@ def _generate_mjpeg():
 
 @app.route("/video_feed")
 def video_feed():
-    return Response(_generate_mjpeg(),
+    return Response(generate_mjpeg(),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 @app.route("/status")
 def status():
     with state_lock:
         return jsonify({k: state[k] for k in
-                        ("fps","error","steer","lane_state","enabled")})
+                        ("fps", "error", "steer", "lane_found", "enabled")})
+
 
 @app.route("/set", methods=["POST"])
 def set_param():
@@ -684,7 +668,7 @@ def set_param():
         for k, v in data.items():
             if k in state:
                 state[k] = v
-                if k in ("kp","ki","kd"):
+                if k in ("kp", "ki", "kd"):
                     pid_state["integral"]   = 0.0
                     pid_state["last_error"] = 0.0
     return jsonify({"ok": True})
@@ -699,4 +683,5 @@ if __name__ == "__main__":
     t.start()
 
     print("[flask] Dashboard → http://0.0.0.0:5000")
+    # use_reloader=False is critical — reloader forks and doubles CPU load
     app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
