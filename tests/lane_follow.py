@@ -63,6 +63,7 @@ state = {
     "enabled": False,
     "min_contour_area": 300,
     "lane_width": 200,             # expected pixel distance between lane lines
+    "lane_adjuster": 0,            # manual offset for lane center
     "roi_side_limit": 0.0,
     # telemetry (read-only from browser)
     "error": 0.0,  "steer": 0.0,  "fps": 0,
@@ -231,6 +232,9 @@ def process_frame(frame, s, annotate: bool):
         lane_center = right_cx - lane_width_px // 2
     else:
         lane_center = w // 2   # fallback (won't be used for error)
+
+    # Apply lane adjuster offset
+    lane_center += s.get("lane_adjuster", 0)
 
     # --- Error & steering ---
     if lane_found:
@@ -471,6 +475,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="val" id="v-lane_width">200</span>
     </div>
     <div class="slider-row">
+      <label>Adjuster</label>
+      <input type="range" id="lane_adjuster" min="-700" max="700" value="0" step="5">
+      <span class="val" id="v-lane_adjuster">0</span>
+    </div>
+    <div class="slider-row">
       <label>Side Crop</label>
       <input type="range" id="roi_side_limit" min="0" max="0.45" value="0.0" step="0.01">
       <span class="val" id="v-roi_side_limit">0.0</span>
@@ -516,7 +525,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 <script>
 const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","s_hi","v_lo","v_hi",
-                 "min_contour_area","lane_width","roi_side_limit"];
+                 "min_contour_area","lane_width","lane_adjuster","roi_side_limit"];
 sliders.forEach(id => {
   const el = document.getElementById(id);
   const disp = document.getElementById("v-"+id);
