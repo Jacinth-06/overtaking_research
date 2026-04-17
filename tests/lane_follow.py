@@ -148,82 +148,71 @@ def process_frame(frame, s, annotate: bool):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
 
-    # --- Contour Extraction ---
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid_contours = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < s["min_contour_area"]: continue
-        M = cv2.moments(cnt)
-        if M["m00"] <= 0: continue
-        cx = int(M["m10"] / M["m00"]) + x_start
-        cy = int(M["m01"] / M["m00"])
-        valid_contours.append((area, cx, cy))
-
-    valid_contours.sort(key=lambda x: x[0], reverse=True)
-    top_lines = valid_contours[:2]
-
-    left_cx, right_cx, left_cy, right_cy = None, None, None, None
-
-    # --- Curvature awareness (turn understanding via steering intent) ---
-    is_turning_left = _last_steer < -0.1
-    is_turning_right = _last_steer > 0.1
-
-    if len(top_lines) == 2:
-        top_lines.sort(key=lambda x: x[1])
-        _, left_cx, left_cy = top_lines[0]
-        _, right_cx, right_cy = top_lines[1]
-    elif len(top_lines) == 1:
-        _, cx, cy = top_lines[0]
-        if is_turning_right: # Turning right -> inner is right line
-            right_cx, right_cy = cx, cy
-        elif is_turning_left: # Turning left -> inner is left line
-            left_cx, left_cy = cx, cy
-        else:
-            if cx < pid_state["last_center"]:
-                left_cx, left_cy = cx, cy
-            else:
-                right_cx, right_cy = cx, cy
-
-    # --- Lane width check (1 lane vs 2 lanes) ---
-    l_det, r_det = left_cx is not None, right_cx is not None
-    lane_found = l_det or r_det
+    # 1. Pixel spreading boundary extraction
+    nonzeros = cv2.findNonZero(mask)
     lane_width_px = s["lane_width"]
+    
+    l_det, r_det = False, False
+    left_cx, right_cx = None, None
+    left_cy = right_cy = mask.shape[0] // 2
+    turn_severity = 0.0
 
-    if l_det and r_det:
-        with state_lock:
-            state["lane_width"] = int(state["lane_width"] * 0.95 + (right_cx - left_cx) * 0.05)
+    if nonzeros is not None:
+        xs = nonzeros[:, 0, 0] + x_start
+        leftmost = int(np.min(xs))
+        rightmost = int(np.max(xs))
+        pixel_spread = rightmost - leftmost
 
-    # --- Center estimation (geometry-based) ---
-    if l_det and r_det:
-        if is_turning_left: raw_center = left_cx + (lane_width_px // 4)
-        elif is_turning_right: raw_center = right_cx - (lane_width_px // 4)
-        else: raw_center = (left_cx + right_cx) // 2
-    elif l_det:
-        offset = (lane_width_px // 4) if is_turning_left else (lane_width_px // 2)
-        raw_center = left_cx + offset
-    elif r_det:
-        offset = (lane_width_px // 4) if is_turning_right else (lane_width_px // 2)
-        raw_center = right_cx - offset
+        # Lookahead shaping: Near vs Far curvature geometry for slowing down
+        h_roi = mask.shape[0]
+        top_nz = cv2.findNonZero(mask[0:h_roi//2, :])
+        bot_nz = cv2.findNonZero(mask[h_roi//2:, :])
+        
+        if top_nz is not None and bot_nz is not None:
+            top_x = np.mean(top_nz[:, 0, 0])
+            bot_x = np.mean(bot_nz[:, 0, 0])
+            # Severity mapping: dampens response if geometry shifts significantly vertically
+            turn_severity = min(1.0, abs(top_x - bot_x) / 80.0)
+
+        # 2. Compute corridor
+        if pixel_spread > lane_width_px * 0.5:
+            # Spread shows 2 boundaries 
+            l_det = r_det = True
+            left_cx, right_cx = leftmost, rightmost
+            raw_center = (leftmost + rightmost) // 2
+            
+            with state_lock:
+                state["lane_width"] = int(lane_width_px * 0.95 + pixel_spread * 0.05)
+        else:
+            # 1 boundary visible: compare with memory
+            line_cx = (leftmost + rightmost) // 2
+            if line_cx < pid_state["last_center"]:
+                l_det = True
+                left_cx = line_cx
+                raw_center = line_cx + lane_width_px // 2
+            else:
+                r_det = True
+                right_cx = line_cx
+                raw_center = line_cx - lane_width_px // 2
     else:
         raw_center = w // 2
 
-    # --- Temporal smoothing (memory) & Jump filtering ---
+    lane_found = l_det or r_det
+
+    # 3. Temporal smoothing & Jump filtering
     if lane_found:
-        # Jump filter: ignore outrageous spikes
         last_smooth = pid_state["stable_center"]
         if abs(raw_center - last_smooth) > 60:
-            raw_center = last_smooth + np.sign(raw_center - last_smooth) * 60
+            raw_center = last_smooth + int(np.sign(raw_center - last_smooth)) * 60
 
-        # Temporal Memory Smoothing
         smooth_center = int(0.6 * raw_center + 0.4 * pid_state["last_center"])
     else:
-        smooth_center = w // 2
+        smooth_center = pid_state["last_center"]
         
     pid_state["last_center"] = smooth_center
     pid_state["stable_center"] = smooth_center
 
-    # --- PID ---
+    # 4. PID Following
     if lane_found:
         error = (smooth_center - w // 2) / (w // 2)
         now = time.time()
@@ -235,7 +224,10 @@ def process_frame(frame, s, annotate: bool):
         pid_state["last_error"] = error
         pid_state["last_time"] = now
 
-        steer = (s["kp"] * error + s["ki"] * pid_state["integral"] + s["kd"] * derivative)
+        # Slow down tracking aggressively if shape curvature demands it
+        effective_kp = s["kp"] * (1.0 - 0.4 * turn_severity)
+        
+        steer = (effective_kp * error + s["ki"] * pid_state["integral"] + s["kd"] * derivative)
         steer = max(-1.0, min(1.0, steer))
         _last_steer = steer
     else:
