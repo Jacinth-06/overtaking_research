@@ -199,7 +199,7 @@ def process_frame(frame, s, annotate: bool):
     line_found = line_cx is not None
 
     if line_found:
-        error = (line_cx - w // 2) / (w // 2)* 2
+        error = (line_cx - w // 2) / (w // 2)* 3
 
         # --- PID ---
         now = time.time()
