@@ -58,12 +58,12 @@ state = {
     "h_lo": 0,  "h_hi": 180,
     "s_lo": 0,  "s_hi": 92,
     "v_lo": 216,  "v_hi": 255,
-    "kp": 0.55,   "ki": 0.003,  "kd": 0.25,
+    "kp": 0.55,   "ki": 0.003,  "kd": 0.35,
     "speed": 0.46,
     "enabled": False,
     "min_contour_area": 300,
     "lane_width": 325,             # expected pixel distance between lane lines
-    "lane_adjuster": -155,            # manual offset for lane center
+    "lane_adjuster": 0,            # manual offset for lane center
     "roi_side_limit": 0.0,
     # telemetry (read-only from browser)
     "error": 0.0,  "steer": 0.0,  "fps": 0,
@@ -235,38 +235,53 @@ def process_frame(frame, s, annotate: bool):
             # It is to the right of the lane center, so it must be the right line
             right_cx, right_cy = cx, cy
 
-    # 4. Compute lane center
+    # --- 4. Dynamic Lane Center Computation ---
     l_det, r_det = left_cx is not None, right_cx is not None
     lane_found = l_det or r_det
 
+    # DYNAMIC BIAS: The 'Pro' Way
+    # Instead of a fixed number, we shift the target based on _last_steer.
+    # If steering hard left (e.g., -0.8), we shift the target center further left.
+    # This keeps the car away from the 'outer' edge where your cream floor is.
+    dynamic_shift = _last_steer * 60  # Adjust 60 to change "hug" intensity
+    
     if l_det and r_det:
-        lane_center = (left_cx + right_cx) // 2
+        # Midpoint + our dynamic preference
+        lane_center = (left_cx + right_cx) // 2 + int(dynamic_shift)
     elif l_det:
-        lane_center = left_cx + lane_width_px // 2
+        # Hug the detected left line
+        lane_center = left_cx + (lane_width_px // 2) - 40 
     elif r_det:
-        lane_center = right_cx - lane_width_px // 2
+        # Hug the detected right line
+        lane_center = right_cx - (lane_width_px // 2) + 40
     else:
-        lane_center = w // 2   # fallback
+        lane_center = w // 2
 
-    # 5. MEMORY UPDATE: Save this center for the next frame's logic
-    if lane_found:
-        pid_state["last_center"] = lane_center # fallback (won't be used for error)
-
-    # Apply lane adjuster offset
+    # Manual adjuster now ONLY used for physical camera misalignment
     lane_center += s.get("lane_adjuster", 0)
+
+    # --- Update Lane Width Memory (Auto-Learning) ---
+    if l_det and r_det:
+        current_width = right_cx - left_cx
+        # Use a slow rolling average (95% old, 5% new)
+        with state_lock:
+            state["lane_width"] = int(state["lane_width"] * 0.95 + current_width * 0.05)
 
     # --- Error & steering ---
     if lane_found:
-        error = (lane_center - w // 2) / (w // 2) * 3  # ×2 gain
-
+        # Normalise error (-1.0 to 1.0)
+        error = (lane_center - w // 2) / (w // 2)
+        
         # --- PID ---
         now = time.time()
         dt  = max(now - pid_state["last_time"], 0.001)
         pid_state["integral"]  += error * dt
         pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
         derivative              = (error - pid_state["last_error"]) / dt
+        
         pid_state["last_error"] = error
         pid_state["last_time"]  = now
+        pid_state["last_center"] = lane_center
 
         steer = (s["kp"] * error
                + s["ki"] * pid_state["integral"]
@@ -274,9 +289,9 @@ def process_frame(frame, s, annotate: bool):
         steer = max(-1.0, min(1.0, steer))
         _last_steer = steer
     else:
-        # Both lines lost → hold last steer
+        # Lost lines -> slowly decay steer or hold
         error = 0.0
-        steer = _last_steer
+        steer = _last_steer * 0.95
 
     # --- Annotate ---
     if annotate:
@@ -462,8 +477,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h2>Drive</h2>
     <div class="slider-row">
       <label>Speed</label>
-      <input type="range" id="speed" min="0" max="60" value="15" step="1">
-      <span class="val" id="v-speed">0.15</span>
+      <input type="range" id="speed" min="0" max="60" value="46" step="1">
+      <span class="val" id="v-speed">0.46</span>
     </div>
     <div class="btn-row">
       <button id="btn-go"   onclick="setEnabled(true)">&#9654; GO</button>
@@ -483,15 +498,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div class="slider-row">
       <label>Kd</label>
-      <input type="range" id="kd" min="0" max="0.5" value="0.25" step="0.01">
-      <span class="val" id="v-kd">0.25</span>
+      <input type="range" id="kd" min="0" max="0.5" value="0.35" step="0.01">
+      <span class="val" id="v-kd">0.35</span>
     </div>
     <hr class="divider">
     <h2>Lane detection</h2>
     <div class="slider-row">
       <label>Lane W</label>
-      <input type="range" id="lane_width" min="50" max="700" value="200" step="5">
-      <span class="val" id="v-lane_width">200</span>
+      <input type="range" id="lane_width" min="50" max="700" value="325" step="5">
+      <span class="val" id="v-lane_width">325</span>
     </div>
     <div class="slider-row">
       <label>Adjuster</label>
