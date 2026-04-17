@@ -467,7 +467,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h2>Lane detection</h2>
     <div class="slider-row">
       <label>Lane W</label>
-      <input type="range" id="lane_width" min="50" max="300" value="200" step="5">
+      <input type="range" id="lane_width" min="50" max="700" value="200" step="5">
       <span class="val" id="v-lane_width">200</span>
     </div>
     <div class="slider-row">
