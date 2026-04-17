@@ -227,14 +227,16 @@ def process_frame(frame, s, annotate: bool):
     elif len(top_lines) == 1:
         _, cx, cy = top_lines[0]
         
-        # If we are steering hard LEFT, a single line is almost certainly the RIGHT (outer) line
-        if _last_steer < -0.2:
+        # FIX: If steering RIGHT (positive), we are likely hugging the RIGHT inner line
+        if _last_steer > 0.1: 
             right_cx, right_cy = cx, cy
-        # If we are steering hard RIGHT, a single line is likely the LEFT (outer) line
-        elif _last_steer > 0.2:
+            left_cx = None
+        # If steering LEFT (negative), we are likely hugging the LEFT inner line
+        elif _last_steer < -0.1:
             left_cx, left_cy = cx, cy
-        # Otherwise, fallback to your spatial check
+            right_cx = None
         else:
+            # Fallback spatial check
             if cx < last_center:
                 left_cx, left_cy = cx, cy
             else:
@@ -303,9 +305,9 @@ def process_frame(frame, s, annotate: bool):
         steer = max(-1.0, min(1.0, steer))
         _last_steer = steer
     else:
-        # Lost lines -> slowly decay steer or hold
+        # Lost lines -> hold last steer
         error = 0.0
-        steer = _last_steer * 0.95
+        steer = _last_steer
 
     # --- Annotate ---
     if annotate:
