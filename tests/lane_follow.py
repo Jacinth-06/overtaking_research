@@ -156,6 +156,7 @@ def process_frame(frame, s, annotate: bool):
     left_cx, right_cx = None, None
     left_cy = right_cy = mask.shape[0] // 2
     turn_severity = 0.0
+    curve_diff = 0.0
 
     if nonzeros is not None:
         xs = nonzeros[:, 0, 0] + x_start
@@ -163,7 +164,7 @@ def process_frame(frame, s, annotate: bool):
         rightmost = int(np.max(xs))
         pixel_spread = rightmost - leftmost
 
-        # Lookahead shaping: Near vs Far curvature geometry for slowing down
+        # Lookahead shaping: Near vs Far curvature geometry
         h_roi = mask.shape[0]
         top_nz = cv2.findNonZero(mask[0:h_roi//2, :])
         bot_nz = cv2.findNonZero(mask[h_roi//2:, :])
@@ -171,12 +172,11 @@ def process_frame(frame, s, annotate: bool):
         if top_nz is not None and bot_nz is not None:
             top_x = np.mean(top_nz[:, 0, 0])
             bot_x = np.mean(bot_nz[:, 0, 0])
-            # Severity mapping: dampens response if geometry shifts significantly vertically
-            turn_severity = min(1.0, abs(top_x - bot_x) / 80.0)
+            curve_diff = top_x - bot_x
+            turn_severity = min(1.0, abs(curve_diff) / 80.0)
 
         # 2. Compute corridor
         if pixel_spread > lane_width_px * 0.5:
-            # Spread shows 2 boundaries 
             l_det = r_det = True
             left_cx, right_cx = leftmost, rightmost
             raw_center = (leftmost + rightmost) // 2
@@ -184,7 +184,6 @@ def process_frame(frame, s, annotate: bool):
             with state_lock:
                 state["lane_width"] = int(lane_width_px * 0.95 + pixel_spread * 0.05)
         else:
-            # 1 boundary visible: compare with memory
             line_cx = (leftmost + rightmost) // 2
             if line_cx < pid_state["last_center"]:
                 l_det = True
@@ -194,6 +193,10 @@ def process_frame(frame, s, annotate: bool):
                 r_det = True
                 right_cx = line_cx
                 raw_center = line_cx - lane_width_px // 2
+                
+        # 1. Bias target inward 
+        # (left turn = negative diff => shift target slightly left, right turn => shift right)
+        raw_center += int(turn_severity * 20 * np.sign(curve_diff))
     else:
         raw_center = w // 2
 
@@ -224,8 +227,13 @@ def process_frame(frame, s, annotate: bool):
         pid_state["last_error"] = error
         pid_state["last_time"] = now
 
-        # Slow down tracking aggressively if shape curvature demands it
         effective_kp = s["kp"] * (1.0 - 0.4 * turn_severity)
+        
+        # 2. Penalize outward drift
+        # Left curve (diff<0) and drifted right (center on left, error<0): boost gain
+        # Right curve (diff>0) and drifted left (center on right, error>0): boost gain
+        if curve_diff * error > 0:
+            effective_kp *= 1.6  # Correct hard!
         
         steer = (effective_kp * error + s["ki"] * pid_state["integral"] + s["kd"] * derivative)
         steer = max(-1.0, min(1.0, steer))
