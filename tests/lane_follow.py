@@ -249,11 +249,11 @@ def process_frame(frame, s, annotate: bool):
         # Midpoint + our dynamic preference
         lane_center = (left_cx + right_cx) // 2 + int(dynamic_shift)
     elif l_det:
-        # Hug the detected left line
-        lane_center = left_cx + (lane_width_px // 2) - 40 
+        # If we only see the LEFT line, stay close to it (don't wander far right)
+        lane_center = left_cx + (lane_width_px // 3) 
     elif r_det:
-        # Hug the detected right line
-        lane_center = right_cx - (lane_width_px // 2) + 40
+        # If we only see the RIGHT line, stay close to it (don't wander far left)
+        lane_center = right_cx - (lane_width_px // 3)
     else:
         lane_center = w // 2
 
