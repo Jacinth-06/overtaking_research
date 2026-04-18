@@ -217,7 +217,7 @@ def process_frame(frame, s, annotate: bool):
 
     # 4. PID Following
     if lane_found:
-        error = (smooth_center - w // 2) / (w // 2)
+        error = (smooth_center - w // 2) / (w // 2) *3
         now = time.time()
         dt = max(now - pid_state["last_time"], 0.001)
         pid_state["integral"] += error * dt
