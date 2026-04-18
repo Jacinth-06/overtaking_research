@@ -1,199 +1,598 @@
-from flask import Flask, Response
-from picamera2 import Picamera2
+"""
+line_follow.py — GPU-accelerated simple line follower + Flask dashboard
+Optimised for Jetson Nano 4 GB.
+
+Detection strategy:
+  • HSV mask isolates the line color (e.g. white line).
+  • Finds the single largest contour.
+  • Uses its centroid to compute error from the center of the frame.
+  • Submits error to a PID controller to steer.
+
+Run:   python line_follow.py
+Open:  http://<jetson-ip>:5000
+"""
+
 import cv2
 import numpy as np
-import signal
-import sys
+import threading
 import time
-from base_ctrl import BaseController
+from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, Response, render_template_string, request, jsonify
 
-# -----------------------------
-# Configuration & Calibration
-# -----------------------------
-FRAME_WIDTH, FRAME_HEIGHT = 580, 440
-BASE_SPEED = 0.12          # Slightly lower base speed helps with sharp turns
-STEER_SENSITIVITY = 0.0025 # INCREASED from 0.0012
+from jetracer import JetRacer
 
-
-
-# Perspective Transform
-SRC_POINTS = np.float32([[50, 480], [590, 480], [240, 300], [400, 300]])
-DST_POINTS = np.float32([[150, 480], [490, 480], [150, 0], [490, 0]])
-M = cv2.getPerspectiveTransform(SRC_POINTS, DST_POINTS)
-
-# Tape Fingerprint Parameters
-EXPECTED_LANE_WIDTH = 340 
-TAPE_WIDTH_PIXELS = 14     
-TAPE_MARGIN = 6
-CONFIDENCE_THRESHOLD = 500 
-SEARCH_MARGIN = 50         
-
-# PID Variables
-Kp, Ki, Kd = 0.7, 0.0, 0.15 # INCREASED Kp and Kd
-last_error = 0
-integral = 0
-
-# -----------------------------
-# Hardware Initialization
-# -----------------------------
-def is_raspberry_pi5():
-    try:
-        with open('/proc/cpuinfo', 'r') as f:
-            return "Raspberry Pi 5" in f.read()
-    except: return False
-
-serial_device = "/dev/ttyAMA0" if is_raspberry_pi5() else "/dev/serial0"
-base = BaseController(serial_device, 115200)
-
-picam2 = Picamera2()
-picam2.configure(picam2.create_preview_configuration(
-    main={"format": "BGR888", "size": (FRAME_WIDTH, FRAME_HEIGHT)}
-))
-picam2.start()
+import os
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"        # Disable MSMF (Windows)
+# GStreamer MUST stay enabled — CSI camera outputs raw Bayer (RG10)
+# and needs nvarguscamerasrc for ISP debayering
+os.environ["OPENCV_VIDEOIO_PRIORITY_FFMPEG"] = "0"      # Disable FFMPEG
 
 app = Flask(__name__)
 
-# -----------------------------
-# Core Logic
-# -----------------------------
+# ── CUDA availability check ───────────────────────────────────────────────────
+USE_CUDA = cv2.cuda.getCudaEnabledDeviceCount() > 0
+if USE_CUDA:
+    print("[init] CUDA device found — GPU path active")
+    _gpu_frame = cv2.cuda_GpuMat()
+    _gpu_hsv   = cv2.cuda_GpuMat()
+    _gpu_mask  = cv2.cuda_GpuMat()
+else:
+    print("[init] No CUDA device — falling back to CPU")
+    _gpu_frame = _gpu_hsv = _gpu_mask = None
 
-def find_tape_center(histogram, start_x, end_x):
-    best_center = None
-    max_score = 0
-    for x in range(start_x, end_x - TAPE_WIDTH_PIXELS - TAPE_MARGIN):
-        score = histogram[x] + histogram[x + TAPE_WIDTH_PIXELS]
-        if score > max_score and score > CONFIDENCE_THRESHOLD:
-            max_score = score
-            best_center = x + (TAPE_WIDTH_PIXELS // 2)
-    return best_center
+# ── Config constants ──────────────────────────────────────────────────────────
+WIDTH, HEIGHT   = 320, 240          # lower res = less GPU/CPU work
+ENCODE_EVERY    = 3                  # encode JPEG only every Nth frame
+JPEG_QUALITY    = 30                 # lower = smaller payload, less CPU
+MJPEG_INTERVAL  = 1 / 15            # 15 fps to browser
+ROI_FRAC        = 0.65              # bottom 50% used as ROI
 
-def process_and_drive(frame):
-    global last_error, integral
+# Pre-allocate morphological kernel (constant — no need to recreate per frame)
+MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+state = {
+    "h_lo": 0,  "h_hi": 180,
+    "s_lo": 0,  "s_hi": 50,
+    "v_lo": 200,  "v_hi": 255,
+    "kp": 0.55,   "ki": 0.003,  "kd": 0.25,
+    "speed": 0.15,
+    "enabled": False,
+    "min_contour_area": 300,       
+    "roi_side_limit": 0.0,         # how much of sides to crop out horizontally
+    # telemetry (read-only from browser)
+    "error": 0.0,  "steer": 0.0,  "fps": 0,
+    "line_found": False,
+}
+
+pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
+state_lock = threading.Lock()
+
+_last_steer = 0.0
+
+# Latest JPEG bytes for MJPEG stream
+frame_lock   = threading.Lock()
+latest_frame = None
+
+# Count of active MJPEG clients — skip annotation when 0
+stream_clients = 0
+clients_lock   = threading.Lock()
+
+# Async JPEG encoder (1 worker is enough; encoding is sequential)
+_encode_pool = ThreadPoolExecutor(max_workers=1)
+
+
+# ── Camera ────────────────────────────────────────────────────────────────────
+def _gstreamer_pipeline(
+    sensor_id=0,
+    capture_width=1280, capture_height=720,
+    display_width=WIDTH, display_height=HEIGHT,
+    framerate=60, flip_method=0,
+):
+    """
+    Build a GStreamer pipeline string for nvarguscamerasrc (Jetson CSI cameras).
+    """
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+        f"video/x-raw(memory:NVMM), "
+        f"width=(int){capture_width}, height=(int){capture_height}, "
+        f"framerate=(fraction){framerate}/1, format=(string)NV12 ! "
+        f"nvvidconv flip-method={flip_method} ! "
+        f"video/x-raw, width=(int){display_width}, height=(int){display_height}, "
+        f"format=(string)BGRx ! "
+        f"videoconvert ! "
+        f"video/x-raw, format=(string)BGR ! "
+        f"appsink drop=1 max-buffers=1"
+    )
+
+def open_camera():
+    # --- Try CSI camera via GStreamer (nvarguscamerasrc) ---
+    gst = _gstreamer_pipeline()
+    print(f"[camera] Trying GStreamer pipeline:\n  {gst}")
+    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+    if cap.isOpened():
+        print(f"[camera] CSI camera via nvarguscamerasrc {WIDTH}×{HEIGHT} OK")
+        return cap
+    print("[camera] GStreamer pipeline failed, trying USB fallback...")
+
+    # --- Fallback: USB camera ---
+    cap = cv2.VideoCapture(0)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        print(f"[camera] USB /dev/video0 {WIDTH}×{HEIGHT} OK")
+        return cap
+
+    raise RuntimeError("No camera found (CSI and USB both failed)")
+
+
+# ── GPU HSV mask ──────────────────────────────────────────────────────────────
+def _make_gpu_hsv_mask():
+    probe = cv2.cuda_GpuMat()
+    probe.upload(np.zeros((1, 1, 3), dtype=np.uint8))
+    try:
+        result = cv2.cuda.cvtColor(probe, cv2.COLOR_BGR2HSV)
+        if result is not None and not result.empty():
+            print("[cuda] cvtColor: functional API (returns GpuMat)")
+            def _mask_functional(roi_bgr, lo, hi):
+                _gpu_frame.upload(roi_bgr)
+                hsv_gpu = cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV)
+                hsv_cpu = hsv_gpu.download()
+                return cv2.inRange(hsv_cpu, lo, hi)
+            return _mask_functional
+    except Exception:
+        pass
+
+    print("[cuda] cvtColor: in-place API (dst arg)")
+    def _mask_inplace(roi_bgr, lo, hi):
+        _gpu_frame.upload(roi_bgr)
+        cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV, _gpu_hsv)
+        hsv_cpu = _gpu_hsv.download()
+        return cv2.inRange(hsv_cpu, lo, hi)
+    return _mask_inplace
+
+def cpu_hsv_mask(roi_bgr, lo, hi):
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    return cv2.inRange(hsv, lo, hi)
+
+gpu_hsv_mask = _make_gpu_hsv_mask() if USE_CUDA else None
+
+
+# ── Simple Single-Line detection + PID ─────────────────────────────────────────
+def process_frame(frame, s, annotate: bool):
+    global _last_steer
     h, w = frame.shape[:2]
-    img_center = w // 2
-
-    # 1. Reverting to Canny Edge Detection (as requested)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    kernel = np.ones((1, 1), np.uint8)
-    edges = cv2.Canny(blur, 50, 150)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel)
-    warped = cv2.warpPerspective(edges, M, (w, h))
-
-    # 2. Histogram with Strict Search Zones
-    # We look at the bottom 40% of the image
-    hist = np.sum(warped[int(h*0.6):, :], axis=0)
+    roi_top = int(h * ROI_FRAC)
     
-    # CRITICAL: Narrow zones prevent picking up noise in the middle
-    left_x = find_tape_center(hist, 0, int(w * 0.35))
-    right_x = find_tape_center(hist, int(w * 0.65), w - 1)
+    # Horizontal ROI cropping
+    x_start = int(w * s["roi_side_limit"])
+    x_end   = w - x_start
+    roi = frame[roi_top:h, x_start:x_end]
 
-    # 3. Lane Reconstruction
-    l_valid, r_valid = left_x is not None, right_x is not None
+    lo = np.array([s["h_lo"], s["s_lo"], s["v_lo"]], dtype=np.uint8)
+    hi = np.array([s["h_hi"], s["s_hi"], s["v_hi"]], dtype=np.uint8)
+
+    # --- Mask: GPU or CPU ---
+    mask = gpu_hsv_mask(roi, lo, hi) if gpu_hsv_mask is not None else cpu_hsv_mask(roi, lo, hi)
+
+    # --- Morphological cleanup (cached kernel) ---
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  MORPH_KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
+
+    # --- Contours ---
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    min_area = s["min_contour_area"]
+    valid_contours = []
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area >= min_area:
+            M = cv2.moments(cnt)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"]) + x_start
+                cy = int(M["m01"] / M["m00"])
+                valid_contours.append((area, cx, cy))
+
+    valid_contours.sort(key=lambda x: x[0], reverse=True)
     
-    if l_valid and r_valid:
-        lane_center = (left_x + right_x) // 2
-        l_col, r_col = (0, 255, 0), (0, 255, 0)
-    elif l_valid:
-        lane_center = left_x + (EXPECTED_LANE_WIDTH // 2)
-        right_x = left_x + EXPECTED_LANE_WIDTH
-        l_col, r_col = (0, 255, 255), (0, 0, 150)
-    elif r_valid:
-        lane_center = right_x - (EXPECTED_LANE_WIDTH // 2)
-        left_x = right_x - EXPECTED_LANE_WIDTH
-        l_col, r_col = (0, 0, 150), (0, 255, 255)
+    line_cx, line_cy = None, None
+    
+    if len(valid_contours) >= 2:
+        c1, c2 = valid_contours[0], valid_contours[1]
+        line_cx = (c1[1] + c2[1]) // 2
+        line_cy = (c1[2] + c2[2]) // 2
+    elif len(valid_contours) == 1:
+        line_cx = valid_contours[0][1]
+        line_cy = valid_contours[0][2]
+
+    line_found = line_cx is not None
+
+    if line_found:
+        error = (line_cx - w // 2) / (w // 2)* 2
+
+        # --- PID ---
+        now = time.time()
+        dt  = max(now - pid_state["last_time"], 0.001)
+        pid_state["integral"]  += error * dt
+        pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
+        derivative              = (error - pid_state["last_error"]) / dt
+        pid_state["last_error"] = error
+        pid_state["last_time"]  = now
+
+        steer = (s["kp"] * error
+               + s["ki"] * pid_state["integral"]
+               + s["kd"] * derivative)
+        steer = max(-1.0, min(1.0, steer))
+        _last_steer = steer
     else:
-        # If totally lost, stop
-        base.send_command({"T": 1, "L": 0.0, "R": 0.0})
-        return cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+        error = 0.0
+        steer = _last_steer
 
-    # 4. Aggressive Control Math
-    error = lane_center - img_center
-    integral += error
-    derivative = error - last_error
-    
-    # Boosted steering adjustment
-    # Increasing STEER_SENSITIVITY makes the speed difference between wheels larger
-    steering_adj = error * STEER_SENSITIVITY 
-    
-    # Pivot Turn Logic: Allow wheels to go down to -0.1 for sharp "on-the-spot" turns
-    # and up to 0.5 for a powerful push
-    left_wheel = np.clip(BASE_SPEED + steering_adj, -0.1, 0.5)
-    right_wheel = np.clip(BASE_SPEED - steering_adj, -0.1, 0.5)
-    
-    base.send_command({"T": 1, "L": round(left_wheel, 3), "R": round(right_wheel, 3)})
-    last_error = error
-
-    # 5. Visualization
-    viz = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
-    cv2.line(viz, (img_center, 0), (img_center, h), (255, 255, 0), 2)
-    cv2.circle(viz, (lane_center, h - 80), 15, (255, 120, 0), -1) 
-    cv2.circle(viz, (left_x, h - 40), 20, l_col, -1)
-    cv2.circle(viz, (right_x, h - 40), 20, r_col, -1)
-    
-    cv2.putText(viz, f"Error: {error}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    return viz
-
-def generate_frames():
-    while True:
-        frame = picam2.capture_array()
-        processed = process_and_drive(frame)
-        ret, jpeg = cv2.imencode(".jpg", processed)
-        if not ret: continue
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-
-@app.route("/start")
-def video():
-    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
-
-
-
-
-# 1. Add a control flag at the top of your script
-is_running = False
-
-
-@app.route("/turn_left")
-def turn_left():
-    # spin left in place
-    base.send_command({"T": 1, "L": -0.1, "R": 0.3})
-    return "Turning left"
-
-@app.route("/start_robot")
-def start_robot():
-    global is_running
-    is_running = True
-    return "Robot movement started!"
-
-@app.route("/stop_robot")
-def stop_robot():
-    global is_running
-    is_running = False
-    # Send stop command immediately
-    base.send_command({"T": 1, "L": 0.0, "R": 0.0})
-    return "Robot stopped!"
-
-def generate_frames():
-    while True:
-        frame = picam2.capture_array()
+    # --- Annotate ---
+    if annotate:
+        annotated = frame.copy()
         
-        # Only process movement if the flag is True
-        if is_running:
-            processed = process_and_drive(frame)
+        # ROI boundary line
+        cv2.line(annotated, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
+
+        # Horizontal crop lines
+        cv2.line(annotated, (x_start, roi_top), (x_start, h), (255, 0, 255), 1)
+        cv2.line(annotated, (x_end, roi_top), (x_end, h), (255, 0, 255), 1)
+
+        # Mask overlay
+        mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        mask_3ch[:, :, 0] = 0
+        annotated[roi_top:h, x_start:x_end] = cv2.addWeighted(
+            annotated[roi_top:h, x_start:x_end], 0.7, mask_3ch, 0.3, 0)
+
+        # Line marker
+        if line_found:
+            if len(valid_contours) >= 2:
+                c1, c2 = valid_contours[0], valid_contours[1]
+                cv2.circle(annotated, (c1[1], roi_top + c1[2]), 8, (0, 255, 255), -1)
+                cv2.circle(annotated, (c2[1], roi_top + c2[2]), 8, (0, 255, 255), -1)
+            elif len(valid_contours) == 1:
+                c1 = valid_contours[0]
+                cv2.circle(annotated, (c1[1], roi_top + c1[2]), 8, (0, 255, 255), -1)
+                
+            cv2.circle(annotated, (line_cx, roi_top + line_cy), 8, (0, 255, 0), -1)
+            cv2.circle(annotated, (line_cx, roi_top + line_cy), 8, (255, 255, 255), 2)
+
+        # Frame center line
+        cv2.line(annotated, (w // 2, roi_top), (w // 2, h), (0, 200, 255), 1)
+
+        # Steer arrow
+        arrow_x = int(w // 2 + steer * (w // 3))
+        cv2.arrowedLine(annotated, (w // 2, 22), (arrow_x, 22),
+                        (0, 140, 255), 2, tipLength=0.35)
+
+        # Status text
+        status = "DRIVING" if s["enabled"] else "STOPPED"
+        color  = (0, 220, 60) if s["enabled"] else (60, 60, 220)
+        cv2.putText(annotated, status, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(annotated, f"e{error:+.2f} s{steer:+.2f}", (5, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+        cv2.putText(annotated, f"fps {s['fps']}", (5, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+
+        lane_col = (0, 220, 60) if line_found else (0, 60, 220)
+        cv2.putText(annotated, "OK" if line_found else "NO", (w - 30, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, lane_col, 1)
+
+    else:
+        annotated = frame   # no copy needed
+
+    return annotated, error, steer, line_found
+
+
+# ── Async JPEG encode ─────────────────────────────────────────────────────────
+def _do_encode(img):
+    ret, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    if not ret:
+        return
+    with frame_lock:
+        global latest_frame
+        latest_frame = jpeg.tobytes()
+
+
+# ── Control loop ──────────────────────────────────────────────────────────────
+def control_loop(car: JetRacer):
+    cap = open_camera()
+    fps_counter, fps_time = 0, time.time()
+    frame_idx = 0
+    print("[loop] Control loop started")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.01)
+            continue
+
+        if len(frame.shape) != 3:
+            continue
+
+        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
+            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+
+        with state_lock:
+            s_copy = dict(state)
+
+        with clients_lock:
+            has_clients = stream_clients > 0
+
+        do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
+        annotated, error, steer, line_found = process_frame(frame, s_copy, do_annotate)
+
+        if do_annotate:
+            _encode_pool.submit(_do_encode, annotated)
+
+        fps_counter += 1
+        if time.time() - fps_time >= 1.0:
+            with state_lock:
+                state["fps"] = fps_counter
+            fps_counter, fps_time = 0, time.time()
+
+        if s_copy["enabled"]:
+            car.steer(steer)
+            car.forward(s_copy["speed"])
         else:
-            processed = frame # Just show the raw camera feed
-            
-        ret, jpeg = cv2.imencode(".jpg", processed)
-        if not ret: continue
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            car.stop()
 
-def cleanup(sig, frame):
-    base.send_command({"T": 1, "L": 0.0, "R": 0.0})
-    picam2.stop()
-    sys.exit(0)
+        with state_lock:
+            state["error"]      = round(error, 3)
+            state["steer"]      = round(steer, 3)
+            state["line_found"] = line_found
 
-signal.signal(signal.SIGINT, cleanup)
+        frame_idx += 1
 
+    cap.release()
+
+
+# ── Flask / dashboard ───────────────────────────────────────────────────────
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JetRacer Single Line Follower</title>
+<style>
+  :root {
+    --bg: #0e1117; --surface: #161b27; --border: #2a3040;
+    --accent: #00d4aa; --warn: #ffb020; --danger: #ff4d4d;
+    --text: #e8ecf1; --muted: #6b7a99;
+    --font: 'JetBrains Mono', 'Fira Mono', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font);
+         display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 1rem; }
+  h1 { font-size: 1rem; letter-spacing: .15em; color: var(--accent);
+       text-transform: uppercase; margin-bottom: 1rem; }
+  .grid { display: grid; grid-template-columns: 1fr 340px; gap: 1rem; width: 100%; max-width: 1100px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; }
+  .card h2 { font-size: .7rem; letter-spacing: .12em; color: var(--muted); text-transform: uppercase;
+             margin-bottom: .75rem; }
+  img#feed { width: 100%; border-radius: 6px; display: block; background: #000; min-height: 180px; }
+  .status-bar { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: .75rem; }
+  .stat { display: flex; flex-direction: column; }
+  .stat-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
+  .stat-lbl { font-size: .65rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  .slider-row { display: flex; align-items: center; gap: .5rem; margin-bottom: .55rem; }
+  .slider-row label { font-size: .7rem; color: var(--muted); width: 65px; flex-shrink: 0; }
+  .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .slider-row .val { font-size: .75rem; width: 45px; text-align: right; color: var(--text); }
+  .btn-row { display: flex; gap: .5rem; margin-top: .75rem; }
+  button { padding: .45rem 1.1rem; border: none; border-radius: 6px; cursor: pointer;
+           font-family: var(--font); font-size: .8rem; font-weight: 600; letter-spacing: .04em; }
+  #btn-go   { background: var(--accent); color: #061612; }
+  #btn-stop { background: var(--danger); color: #fff; }
+  #btn-go:hover   { filter: brightness(1.1); }
+  #btn-stop:hover { filter: brightness(1.1); }
+  .error-track { position: relative; height: 18px; background: var(--border);
+                 border-radius: 9px; margin-top: .5rem; overflow: hidden; }
+  #error-bar { position: absolute; height: 100%; width: 4px; background: var(--accent);
+               left: 50%; transform: translateX(-50%); transition: left .1s; border-radius: 9px; }
+  .divider { border: none; border-top: 1px solid var(--border); margin: .75rem 0; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<h1>&#9675; JetRacer &#183; Single Line Dashboard</h1>
+<div class="grid">
+  <div class="card">
+    <h2>Camera feed (annotated)</h2>
+    <img id="feed" src="/video_feed" alt="camera">
+    <div class="status-bar" style="margin-top:.75rem">
+      <div class="stat"><span class="stat-val" id="v-fps">0</span><span class="stat-lbl">fps</span></div>
+      <div class="stat"><span class="stat-val" id="v-err">0.00</span><span class="stat-lbl">error</span></div>
+      <div class="stat"><span class="stat-val" id="v-str">0.00</span><span class="stat-lbl">steer</span></div>
+      <div class="stat"><span class="stat-val" id="v-lane">—</span><span class="stat-lbl">line</span></div>
+    </div>
+    <div class="error-track" title="Line error (centre = 0)">
+      <div id="error-bar"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Drive</h2>
+    <div class="slider-row">
+      <label>Speed</label>
+      <input type="range" id="speed" min="0" max="60" value="15" step="1">
+      <span class="val" id="v-speed">0.15</span>
+    </div>
+    <div class="btn-row">
+      <button id="btn-go"   onclick="setEnabled(true)">&#9654; GO</button>
+      <button id="btn-stop" onclick="setEnabled(false)">&#9632; STOP</button>
+    </div>
+    <hr class="divider">
+    <h2>PID gains</h2>
+    <div class="slider-row">
+      <label>Kp</label>
+      <input type="range" id="kp" min="0" max="1" value="0.55" step="0.01">
+      <span class="val" id="v-kp">0.55</span>
+    </div>
+    <div class="slider-row">
+      <label>Ki</label>
+      <input type="range" id="ki" min="0" max="0.05" value="0.003" step="0.001">
+      <span class="val" id="v-ki">0.003</span>
+    </div>
+    <div class="slider-row">
+      <label>Kd</label>
+      <input type="range" id="kd" min="0" max="0.5" value="0.25" step="0.01">
+      <span class="val" id="v-kd">0.25</span>
+    </div>
+    <hr class="divider">
+    <h2>Line detection</h2>
+    <div class="slider-row">
+      <label>Side Crop</label>
+      <input type="range" id="roi_side_limit" min="0" max="0.45" value="0.0" step="0.01">
+      <span class="val" id="v-roi_side_limit">0.0</span>
+    </div>
+    <div class="slider-row">
+      <label>Min area</label>
+      <input type="range" id="min_contour_area" min="50" max="5000" value="300" step="50">
+      <span class="val" id="v-min_contour_area">300</span>
+    </div>
+    <hr class="divider">
+    <h2>HSV mask</h2>
+    <div class="slider-row">
+      <label>H lo</label>
+      <input type="range" id="h_lo" min="0" max="179" value="0" step="1">
+      <span class="val" id="v-h_lo">0</span>
+    </div>
+    <div class="slider-row">
+      <label>H hi</label>
+      <input type="range" id="h_hi" min="0" max="179" value="180" step="1">
+      <span class="val" id="v-h_hi">180</span>
+    </div>
+    <div class="slider-row">
+      <label>S lo</label>
+      <input type="range" id="s_lo" min="0" max="255" value="0" step="1">
+      <span class="val" id="v-s_lo">0</span>
+    </div>
+    <div class="slider-row">
+      <label>S hi</label>
+      <input type="range" id="s_hi" min="0" max="255" value="50" step="1">
+      <span class="val" id="v-s_hi">50</span>
+    </div>
+    <div class="slider-row">
+      <label>V lo</label>
+      <input type="range" id="v_lo" min="0" max="255" value="200" step="1">
+      <span class="val" id="v-v_lo">200</span>
+    </div>
+    <div class="slider-row">
+      <label>V hi</label>
+      <input type="range" id="v_hi" min="0" max="255" value="255" step="1">
+      <span class="val" id="v-v_hi">255</span>
+    </div>
+  </div>
+</div>
+<script>
+const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","s_hi","v_lo","v_hi",
+                 "min_contour_area","roi_side_limit"];
+sliders.forEach(id => {
+  const el = document.getElementById(id);
+  const disp = document.getElementById("v-"+id);
+  el.addEventListener("input", () => {
+    const v = parseFloat(el.value);
+    if (id === "speed") {
+      disp.textContent = (v/100).toFixed(2);
+      sendParam(id, v/100);
+    } else if (id === "roi_side_limit") {
+      disp.textContent = v.toFixed(2);
+      sendParam(id, v);
+    } else {
+      disp.textContent = Number.isInteger(v) ? v : v.toFixed(3);
+      sendParam(id, v);
+    }
+  });
+});
+function sendParam(key, value) {
+  fetch("/set", {method:"POST", headers:{"Content-Type":"application/json"},
+                 body: JSON.stringify({[key]: value})});
+}
+function setEnabled(v) {
+  fetch("/set", {method:"POST", headers:{"Content-Type":"application/json"},
+                 body: JSON.stringify({enabled: v})});
+}
+async function poll() {
+  try {
+    const r = await fetch("/status");
+    const d = await r.json();
+    document.getElementById("v-fps").textContent  = d.fps;
+    document.getElementById("v-err").textContent  = d.error.toFixed(2);
+    document.getElementById("v-str").textContent  = d.steer.toFixed(2);
+
+    const lineEl = document.getElementById("v-lane");
+    lineEl.textContent = d.line_found ? "✓" : "✗";
+    lineEl.style.color = d.line_found ? "#00d4aa" : "#ff4d4d";
+
+    const pct = (d.error + 1) / 2 * 100;
+    const bar = document.getElementById("error-bar");
+    bar.style.left = pct + "%";
+    bar.style.background = Math.abs(d.error) > 0.5 ? "#ff4d4d" : "#00d4aa";
+  } catch(e) {}
+  setTimeout(poll, 250);
+}
+poll();
+</script>
+</body>
+</html>"""
+
+
+@app.route("/")
+def index():
+    return render_template_string(DASHBOARD_HTML)
+
+def generate_mjpeg():
+    global stream_clients
+    with clients_lock:
+        stream_clients += 1
+    try:
+        while True:
+            with frame_lock:
+                frame = latest_frame
+            if frame is None:
+                time.sleep(0.02)
+                continue
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            time.sleep(MJPEG_INTERVAL)
+    finally:
+        with clients_lock:
+            stream_clients -= 1
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_mjpeg(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/status")
+def status():
+    with state_lock:
+        return jsonify({k: state[k] for k in
+                        ("fps", "error", "steer", "line_found", "enabled")})
+
+
+@app.route("/set", methods=["POST"])
+def set_param():
+    data = request.get_json(force=True)
+    with state_lock:
+        for k, v in data.items():
+            if k in state:
+                state[k] = v
+                if k in ("kp", "ki", "kd"):
+                    pid_state["integral"]   = 0.0
+                    pid_state["last_error"] = 0.0
+    return jsonify({"ok": True})
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, threaded=True)
+    car = JetRacer()
+    car.arm(delay=3)
+
+    t = threading.Thread(target=control_loop, args=(car,), daemon=True)
+    t.start()
+
+    print("[flask] Dashboard → http://0.0.0.0:5000")
+    # use_reloader=False is critical — reloader forks and doubles CPU load
+    app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
