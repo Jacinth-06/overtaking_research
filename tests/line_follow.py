@@ -189,17 +189,23 @@ def process_frame(frame, s, annotate: bool):
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > best_area and area >= min_area:
+        if area >= min_area:
             M = cv2.moments(cnt)
             if M["m00"] > 0:
-                line_cx = int(M["m10"] / M["m00"]) + x_start
-                line_cy = int(M["m01"] / M["m00"])
-                best_area = area
+                cx = int(M["m10"] / M["m00"]) + x_start
+                cy = int(M["m01"] / M["m00"])
+                # Always lock onto the LEFTMOST line if multiple candidates found
+                if line_cx is None or cx < line_cx:
+                    line_cx = cx
+                    line_cy = cy
 
     line_found = line_cx is not None
 
     if line_found:
-        error = (line_cx - w // 2) / (w // 2)* 2
+        offset =140
+        target = line_cx + offset
+        target = max(60,min(w-60,target))
+        error = (target - w // 2) / (w // 2)* 2
 
         # --- PID ---
         now = time.time()
