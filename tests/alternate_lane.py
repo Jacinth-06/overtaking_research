@@ -1,14 +1,17 @@
 """
-line_follow.py — GPU-accelerated simple line follower + Flask dashboard
-Optimised for Jetson Nano 4 GB.
+lane_follow.py — GPU-accelerated dual-lane follower + Flask dashboard
+Optimised for Jetson Nano 4 GB, black road with white lines on both sides.
 
 Detection strategy:
-  • HSV mask isolates the line color (e.g. white line).
-  • Finds the single largest contour.
-  • Uses its centroid to compute error from the center of the frame.
-  • Submits error to a PID controller to steer.
+  • HSV mask isolates white lane lines.
+  • ROI split into left zone / right zone.
+  • Largest contour in each zone → left_cx, right_cx.
+  • Both found → lane center = midpoint.
+  • One found  → lane center = inferred from detected line + lane_width.
+  • None found → hold last steer value until lane is found again.
+  • Error gain multiplied by 2 for sharper response.
 
-Run:   python line_follow.py
+Run:   python lane_follow.py
 Open:  http://<jetson-ip>:5000
 """
 
@@ -45,7 +48,7 @@ WIDTH, HEIGHT   = 320, 240          # lower res = less GPU/CPU work
 ENCODE_EVERY    = 3                  # encode JPEG only every Nth frame
 JPEG_QUALITY    = 30                 # lower = smaller payload, less CPU
 MJPEG_INTERVAL  = 1 / 15            # 15 fps to browser
-ROI_FRAC        = 0.65              # bottom 50% used as ROI
+ROI_FRAC        = 0.65              # bottom 35% used as ROI
 
 # Pre-allocate morphological kernel (constant — no need to recreate per frame)
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -53,16 +56,18 @@ MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = {
     "h_lo": 0,  "h_hi": 180,
-    "s_lo": 0,  "s_hi": 50,
-    "v_lo": 200,  "v_hi": 255,
+    "s_lo": 0,  "s_hi": 92,
+    "v_lo": 216,  "v_hi": 255,
     "kp": 0.55,   "ki": 0.003,  "kd": 0.25,
-    "speed": 0.15,
+    "speed": 0.46,
     "enabled": False,
-    "min_contour_area": 300,       
-    "roi_side_limit": 0.0,         # how much of sides to crop out horizontally
+    "min_contour_area": 300,
+    "lane_width": 325,             # expected pixel distance between lane lines
+    "lane_adjuster": -155,            # manual offset for lane center
+    "roi_side_limit": 0.0,
     # telemetry (read-only from browser)
     "error": 0.0,  "steer": 0.0,  "fps": 0,
-    "line_found": False,
+    "lane_found": False,
 }
 
 pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
@@ -159,12 +164,12 @@ def cpu_hsv_mask(roi_bgr, lo, hi):
 gpu_hsv_mask = _make_gpu_hsv_mask() if USE_CUDA else None
 
 
-# ── Simple Single-Line detection + PID ─────────────────────────────────────────
+# ── Dual-lane detection + PID ─────────────────────────────────────────────────
 def process_frame(frame, s, annotate: bool):
     global _last_steer
     h, w = frame.shape[:2]
     roi_top = int(h * ROI_FRAC)
-    
+
     # Horizontal ROI cropping
     x_start = int(w * s["roi_side_limit"])
     x_end   = w - x_start
@@ -183,34 +188,76 @@ def process_frame(frame, s, annotate: bool):
     # --- Contours ---
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    min_area = s["min_contour_area"]
-    valid_contours = []
+    roi_w       = x_end - x_start
+    mid_x       = roi_w // 2
+    min_area    = s["min_contour_area"]
+    lane_width_px = s["lane_width"]
 
+    # Classify contours into left/right by centroid relative to ROI center
+    # 1. Gather all valid lines
+    valid_contours = []
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area >= min_area:
-            M = cv2.moments(cnt)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"]) + x_start
-                cy = int(M["m01"] / M["m00"])
-                valid_contours.append((area, cx, cy))
+        if area < min_area:
+            continue
+        M = cv2.moments(cnt)
+        if M["m00"] <= 0:
+            continue
+        cx = int(M["m10"] / M["m00"]) + x_start # absolute X mapping
+        cy = int(M["m01"] / M["m00"])
+        valid_contours.append((area, cx, cy))
 
+    # 2. Sort by area (descending) to find the two most prominent lines
     valid_contours.sort(key=lambda x: x[0], reverse=True)
-    
-    line_cx, line_cy = None, None
-    
-    if len(valid_contours) >= 2:
-        c1, c2 = valid_contours[0], valid_contours[1]
-        line_cx = (c1[1] + c2[1]) // 2
-        line_cy = (c1[2] + c2[2]) // 2
-    elif len(valid_contours) == 1:
-        line_cx = valid_contours[0][1]
-        line_cy = valid_contours[0][2]
+    top_lines = valid_contours[:2]
 
-    line_found = line_cx is not None
+    left_cx, right_cx, left_cy, right_cy = None, None, None, None
 
-    if line_found:
-        error = (line_cx - w // 2) / (w // 2)* 2
+    # Get the last known lane center to intelligently classify a single line
+    # (Defaults to center of screen if starting fresh)
+    last_center = pid_state.get("last_center", w // 2)
+
+    # 3. Smart Classification
+    if len(top_lines) == 2:
+        # If we see two lines, the one with the smaller X is definitively Left
+        top_lines.sort(key=lambda x: x[1])
+        _, left_cx, left_cy = top_lines[0]
+        _, right_cx, right_cy = top_lines[1]
+        
+    elif len(top_lines) == 1:
+        # If we only see ONE line, compare it to the LAST KNOWN center
+        _, cx, cy = top_lines[0]
+        
+        if cx < last_center:
+            # It is to the left of the lane center, so it must be the left line
+            left_cx, left_cy = cx, cy
+        else:
+            # It is to the right of the lane center, so it must be the right line
+            right_cx, right_cy = cx, cy
+
+    # 4. Compute lane center
+    l_det, r_det = left_cx is not None, right_cx is not None
+    lane_found = l_det or r_det
+
+    if l_det and r_det:
+        lane_center = (left_cx + right_cx) // 2
+    elif l_det:
+        lane_center = left_cx + lane_width_px // 2
+    elif r_det:
+        lane_center = right_cx - lane_width_px // 2
+    else:
+        lane_center = w // 2   # fallback
+
+    # 5. MEMORY UPDATE: Save this center for the next frame's logic
+    if lane_found:
+        pid_state["last_center"] = lane_center # fallback (won't be used for error)
+
+    # Apply lane adjuster offset
+    lane_center += s.get("lane_adjuster", 0)
+
+    # --- Error & steering ---
+    if lane_found:
+        error = (lane_center - w // 2) / (w // 2) * 3  # ×2 gain
 
         # --- PID ---
         now = time.time()
@@ -227,13 +274,14 @@ def process_frame(frame, s, annotate: bool):
         steer = max(-1.0, min(1.0, steer))
         _last_steer = steer
     else:
+        # Both lines lost → hold last steer
         error = 0.0
         steer = _last_steer
 
     # --- Annotate ---
     if annotate:
         annotated = frame.copy()
-        
+
         # ROI boundary line
         cv2.line(annotated, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
 
@@ -247,18 +295,18 @@ def process_frame(frame, s, annotate: bool):
         annotated[roi_top:h, x_start:x_end] = cv2.addWeighted(
             annotated[roi_top:h, x_start:x_end], 0.7, mask_3ch, 0.3, 0)
 
-        # Line marker
-        if line_found:
-            if len(valid_contours) >= 2:
-                c1, c2 = valid_contours[0], valid_contours[1]
-                cv2.circle(annotated, (c1[1], roi_top + c1[2]), 8, (0, 255, 255), -1)
-                cv2.circle(annotated, (c2[1], roi_top + c2[2]), 8, (0, 255, 255), -1)
-            elif len(valid_contours) == 1:
-                c1 = valid_contours[0]
-                cv2.circle(annotated, (c1[1], roi_top + c1[2]), 8, (0, 255, 255), -1)
-                
-            cv2.circle(annotated, (line_cx, roi_top + line_cy), 8, (0, 255, 0), -1)
-            cv2.circle(annotated, (line_cx, roi_top + line_cy), 8, (255, 255, 255), 2)
+        # Lane markers
+        if l_det:
+            cv2.circle(annotated, (left_cx, roi_top + left_cy), 8, (0, 255, 0), -1)
+            cv2.circle(annotated, (left_cx, roi_top + left_cy), 8, (255, 255, 255), 2)
+        if r_det:
+            cv2.circle(annotated, (right_cx, roi_top + right_cy), 8, (0, 255, 0), -1)
+            cv2.circle(annotated, (right_cx, roi_top + right_cy), 8, (255, 255, 255), 2)
+
+        # Lane center marker (cyan)
+        if lane_found:
+            cy_mid = roi_top + (h - roi_top) // 2
+            cv2.circle(annotated, (lane_center, cy_mid), 6, (255, 200, 0), -1)
 
         # Frame center line
         cv2.line(annotated, (w // 2, roi_top), (w // 2, h), (0, 200, 255), 1)
@@ -275,13 +323,13 @@ def process_frame(frame, s, annotate: bool):
         cv2.putText(annotated, f"e{error:+.2f} s{steer:+.2f}", (5, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
         cv2.putText(annotated, f"fps {s['fps']}", (5, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
 
-        lane_col = (0, 220, 60) if line_found else (0, 60, 220)
-        cv2.putText(annotated, "OK" if line_found else "NO", (w - 30, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, lane_col, 1)
+        lane_col = (0, 220, 60) if lane_found else (0, 60, 220)
+        cv2.putText(annotated, "OK" if lane_found else "NO", (w - 30, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, lane_col, 1)
 
     else:
         annotated = frame   # no copy needed
 
-    return annotated, error, steer, line_found
+    return annotated, error, steer, lane_found
 
 
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
@@ -320,7 +368,7 @@ def control_loop(car: JetRacer):
             has_clients = stream_clients > 0
 
         do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
-        annotated, error, steer, line_found = process_frame(frame, s_copy, do_annotate)
+        annotated, error, steer, lane_found = process_frame(frame, s_copy, do_annotate)
 
         if do_annotate:
             _encode_pool.submit(_do_encode, annotated)
@@ -340,7 +388,7 @@ def control_loop(car: JetRacer):
         with state_lock:
             state["error"]      = round(error, 3)
             state["steer"]      = round(steer, 3)
-            state["line_found"] = line_found
+            state["lane_found"] = lane_found
 
         frame_idx += 1
 
@@ -353,7 +401,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JetRacer Single Line Follower</title>
+<title>JetRacer Lane Follower</title>
 <style>
   :root {
     --bg: #0e1117; --surface: #161b27; --border: #2a3040;
@@ -395,7 +443,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>&#9675; JetRacer &#183; Single Line Dashboard</h1>
+<h1>&#9675; JetRacer &#183; Lane Follow Dashboard</h1>
 <div class="grid">
   <div class="card">
     <h2>Camera feed (annotated)</h2>
@@ -404,9 +452,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat"><span class="stat-val" id="v-fps">0</span><span class="stat-lbl">fps</span></div>
       <div class="stat"><span class="stat-val" id="v-err">0.00</span><span class="stat-lbl">error</span></div>
       <div class="stat"><span class="stat-val" id="v-str">0.00</span><span class="stat-lbl">steer</span></div>
-      <div class="stat"><span class="stat-val" id="v-lane">—</span><span class="stat-lbl">line</span></div>
+      <div class="stat"><span class="stat-val" id="v-lane">—</span><span class="stat-lbl">lane</span></div>
     </div>
-    <div class="error-track" title="Line error (centre = 0)">
+    <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
     </div>
   </div>
@@ -439,7 +487,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="val" id="v-kd">0.25</span>
     </div>
     <hr class="divider">
-    <h2>Line detection</h2>
+    <h2>Lane detection</h2>
+    <div class="slider-row">
+      <label>Lane W</label>
+      <input type="range" id="lane_width" min="50" max="700" value="200" step="5">
+      <span class="val" id="v-lane_width">200</span>
+    </div>
+    <div class="slider-row">
+      <label>Adjuster</label>
+      <input type="range" id="lane_adjuster" min="-700" max="700" value="0" step="5">
+      <span class="val" id="v-lane_adjuster">0</span>
+    </div>
     <div class="slider-row">
       <label>Side Crop</label>
       <input type="range" id="roi_side_limit" min="0" max="0.45" value="0.0" step="0.01">
@@ -486,7 +544,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 <script>
 const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","s_hi","v_lo","v_hi",
-                 "min_contour_area","roi_side_limit"];
+                 "min_contour_area","lane_width","lane_adjuster","roi_side_limit"];
 sliders.forEach(id => {
   const el = document.getElementById(id);
   const disp = document.getElementById("v-"+id);
@@ -520,9 +578,9 @@ async function poll() {
     document.getElementById("v-err").textContent  = d.error.toFixed(2);
     document.getElementById("v-str").textContent  = d.steer.toFixed(2);
 
-    const lineEl = document.getElementById("v-lane");
-    lineEl.textContent = d.line_found ? "✓" : "✗";
-    lineEl.style.color = d.line_found ? "#00d4aa" : "#ff4d4d";
+    const laneEl = document.getElementById("v-lane");
+    laneEl.textContent = d.lane_found ? "✓" : "✗";
+    laneEl.style.color = d.lane_found ? "#00d4aa" : "#ff4d4d";
 
     const pct = (d.error + 1) / 2 * 100;
     const bar = document.getElementById("error-bar");
@@ -569,7 +627,7 @@ def video_feed():
 def status():
     with state_lock:
         return jsonify({k: state[k] for k in
-                        ("fps", "error", "steer", "line_found", "enabled")})
+                        ("fps", "error", "steer", "lane_found", "enabled")})
 
 
 @app.route("/set", methods=["POST"])
