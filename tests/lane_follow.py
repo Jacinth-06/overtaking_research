@@ -33,7 +33,7 @@ WIDTH, HEIGHT   = 320, 240
 ENCODE_EVERY    = 3
 JPEG_QUALITY    = 30
 MJPEG_INTERVAL  = 1 / 15
-ROI_FRAC        = 0.65
+ROI_FRAC        = 0.5
 
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
@@ -128,7 +128,7 @@ def compute_mask(roi_bgr, s):
     sobel_mask[(scaled_sobel >= s["sobel_min"]) & (scaled_sobel <= s["sobel_max"])] = 255
 
     # 4. HLS + Sobel combination
-    return cv2.bitwise_or(color_mask, sobel_mask)
+    return cv2.bitwise_and(color_mask, sobel_mask)
 
 
 def process_frame(frame, s, annotate: bool):
@@ -224,16 +224,27 @@ def process_frame(frame, s, annotate: bool):
     if lane_found:
         bottom_start = int(mask.shape[0] * 0.75)
         bottom_mask = mask[bottom_start:, :]
-        bot_nz = cv2.findNonZero(bottom_mask)
-        
-        if bot_nz is not None and len(bot_nz) > 20:
-            xs_bot = bot_nz[:, 0, 0] + x_start
-            bottom_center = (int(np.min(xs_bot)) + int(np.max(xs_bot))) // 2
-            final_center = 0.7 * bottom_center + 0.3 * smooth_center
+        h_bot = bottom_mask.shape[0]
+        valid_xs = []
+
+        for i in range(h_bot):
+            row = bottom_mask[i]
+            xs = np.where(row > 0)[0]
+            
+            # Ignore noisy rows
+            if len(xs) > 10:  
+                valid_xs.append(xs)
+
+        if len(valid_xs) > 3:
+            lefts = [xs[0] for xs in valid_xs]
+            rights = [xs[-1] for xs in valid_xs]
+            
+            bottom_center = (int(np.mean(lefts)) + int(np.mean(rights))) // 2 + x_start
+            final_center = int(0.7 * bottom_center + 0.3 * smooth_center)
         else:
             final_center = smooth_center
 
-        error = (final_center - w // 2) / (w // 2) * 3
+        error = (final_center - w // 2) / (w // 2) 
         now = time.time()
         dt = max(now - pid_state["last_time"], 0.001)
         pid_state["integral"] += error * dt
@@ -249,7 +260,7 @@ def process_frame(frame, s, annotate: bool):
         # Left curve (diff<0) and drifted right (center on left, error<0): boost gain
         # Right curve (diff>0) and drifted left (center on right, error>0): boost gain
         if curve_diff * error > 0:
-            effective_kp *= 1.6  # Correct hard!
+            effective_kp *= 1.2 # Correct hard!
         
         steer = (effective_kp * error + s["ki"] * pid_state["integral"] + s["kd"] * derivative)
         steer = max(-1.0, min(1.0, steer))
