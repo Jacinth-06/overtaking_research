@@ -436,11 +436,10 @@ def control_loop():
         if do_annotate: _encode_pool.submit(_do_encode, annotated)
         
         if s_copy["enabled"]:
-            car.steering = steer
-            car.throttle = s_copy["speed"] if lane_found else s_copy["speed"] * 0.5
+            car.steer(steer)
+            car.forward(s_copy["speed"] if lane_found else s_copy["speed"] * 0.5)
         else:
-            car.steering = 0.0
-            car.throttle = 0.0
+            car.stop()
             
         with state_lock:
             state["error"], state["steer"], state["lane_found"] = round(error, 3), round(steer, 3), lane_found
