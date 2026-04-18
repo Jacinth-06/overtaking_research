@@ -40,10 +40,10 @@ MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = {
     # Masks
-    "blur_k": 5, "sobel_min": 20, "sobel_max": 255,
+    "blur_k": 5, "sobel_min": 40, "sobel_max": 255,
     "h_lo": 0, "h_hi": 180,
-    "l_lo": 0, "l_hi": 255,
-    "s_lo": 40, "s_hi": 255,
+    "l_lo": 120, "l_hi": 255,
+    "s_lo": 60, "s_hi": 255,
     
     # PID & Drive
     "kp": 0.75, "ki": 0.003, "kd": 0.35, "speed": 0.46, "enabled": False,
@@ -158,11 +158,15 @@ def process_frame(frame, s, annotate: bool):
     turn_severity = 0.0
     curve_diff = 0.0
 
-    if nonzeros is not None:
-        xs = nonzeros[:, 0, 0] + x_start
-        leftmost = int(np.min(xs))
-        rightmost = int(np.max(xs))
-        pixel_spread = rightmost - leftmost
+    if nonzeros is not None and len(nonzeros) > s["min_contour_area"]:
+        valid_rows = np.any(mask > 0, axis=1)
+        first_x = np.argmax(mask[valid_rows] > 0, axis=1) + x_start
+        last_x = mask.shape[1] - 1 - np.argmax(mask[valid_rows, ::-1] > 0, axis=1) + x_start
+        
+        row_spreads = last_x - first_x
+        pixel_spread = int(np.max(row_spreads)) if len(row_spreads) > 0 else 0
+        leftmost = int(np.min(first_x)) if len(first_x) > 0 else 0
+        rightmost = int(np.max(last_x)) if len(last_x) > 0 else 0
 
         # Lookahead shaping: Near vs Far curvature geometry
         h_roi = mask.shape[0]
@@ -182,7 +186,8 @@ def process_frame(frame, s, annotate: bool):
             raw_center = (leftmost + rightmost) // 2
             
             with state_lock:
-                state["lane_width"] = int(lane_width_px * 0.95 + pixel_spread * 0.05)
+                new_width = int(lane_width_px * 0.95 + pixel_spread * 0.05)
+                state["lane_width"] = max(50, min(700, new_width))
         else:
             line_cx = (leftmost + rightmost) // 2
             if line_cx < pid_state["last_center"]:
@@ -217,7 +222,18 @@ def process_frame(frame, s, annotate: bool):
 
     # 4. PID Following
     if lane_found:
-        error = (smooth_center - w // 2) / (w // 2) *3
+        bottom_start = int(mask.shape[0] * 0.75)
+        bottom_mask = mask[bottom_start:, :]
+        bot_nz = cv2.findNonZero(bottom_mask)
+        
+        if bot_nz is not None and len(bot_nz) > 20:
+            xs_bot = bot_nz[:, 0, 0] + x_start
+            bottom_center = (int(np.min(xs_bot)) + int(np.max(xs_bot))) // 2
+            final_center = 0.7 * bottom_center + 0.3 * smooth_center
+        else:
+            final_center = smooth_center
+
+        error = (final_center - w // 2) / (w // 2) * 3
         now = time.time()
         dt = max(now - pid_state["last_time"], 0.001)
         pid_state["integral"] += error * dt
@@ -336,11 +352,11 @@ DASHBOARD_HTML = """
     <div class="slider-row"><label>Side Crop</label><input type="range" id="roi_side_limit" min="0" max="0.45" value="0.0" step="0.01"><span class="val" id="v-roi_side_limit">0.0</span></div>
     <hr class="divider">
     <h2>HLS + Sobel Thresholds</h2>
-    <div class="slider-row"><label>Sob Min</label><input type="range" id="sobel_min" min="0" max="255" value="20" step="1"><span class="val" id="v-sobel_min">20</span></div>
+    <div class="slider-row"><label>Sob Min</label><input type="range" id="sobel_min" min="0" max="255" value="40" step="1"><span class="val" id="v-sobel_min">40</span></div>
     <div class="slider-row"><label>Sob Max</label><input type="range" id="sobel_max" min="0" max="255" value="255" step="1"><span class="val" id="v-sobel_max">255</span></div>
-    <div class="slider-row"><label>L lo</label><input type="range" id="l_lo" min="0" max="255" value="0" step="1"><span class="val" id="v-l_lo">0</span></div>
+    <div class="slider-row"><label>L lo</label><input type="range" id="l_lo" min="0" max="255" value="120" step="1"><span class="val" id="v-l_lo">120</span></div>
     <div class="slider-row"><label>L hi</label><input type="range" id="l_hi" min="0" max="255" value="255" step="1"><span class="val" id="v-l_hi">255</span></div>
-    <div class="slider-row"><label>S lo</label><input type="range" id="s_lo" min="0" max="255" value="40" step="1"><span class="val" id="v-s_lo">40</span></div>
+    <div class="slider-row"><label>S lo</label><input type="range" id="s_lo" min="0" max="255" value="60" step="1"><span class="val" id="v-s_lo">60</span></div>
     <div class="slider-row"><label>S hi</label><input type="range" id="s_hi" min="0" max="255" value="255" step="1"><span class="val" id="v-s_hi">255</span></div>
   </div>
 </div>
