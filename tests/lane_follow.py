@@ -33,7 +33,7 @@ WIDTH, HEIGHT   = 320, 240
 ENCODE_EVERY    = 3
 JPEG_QUALITY    = 30
 MJPEG_INTERVAL  = 1 / 15
-ROI_FRAC        = 0.5
+ROI_FRAC        = 0.3
 
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
