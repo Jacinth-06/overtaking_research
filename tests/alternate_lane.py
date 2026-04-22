@@ -156,30 +156,28 @@ class CUDAStream:
 
     def __init__(self):
         if self.HAS_CV_CUDA:
-            self.stream = cv2.cuda.Stream()
-            log.info("OpenCV CUDA enabled – GPU stream created.")
+            log.info("OpenCV CUDA enabled – GPU sync mode (no explicit stream).")
         else:
-            self.stream = None
             log.warning("OpenCV CUDA NOT available – falling back to CPU cv2.")
 
     # ── Upload / Download ────────────────────────────────────────────────────
-    def upload(self, mat: np.ndarray) -> "GpuMat | np.ndarray":
+    def upload(self, mat: np.ndarray):
         if self.HAS_CV_CUDA:
             g = cv2.cuda_GpuMat()
-            g.upload(mat, self.stream)
+            g.upload(mat)
             return g
         return mat
 
     def download(self, g) -> np.ndarray:
         if self.HAS_CV_CUDA and isinstance(g, cv2.cuda_GpuMat):
-            return g.download(self.stream)
+            return g.download()
         return g
 
     # ── Per-op wrappers ──────────────────────────────────────────────────────
     def cvtColor(self, g, code):
         if self.HAS_CV_CUDA:
             dst = cv2.cuda_GpuMat()
-            cv2.cuda.cvtColor(g, code, dst=dst, stream=self.stream)
+            cv2.cuda.cvtColor(g, code, dst=dst)
             return dst
         return cv2.cvtColor(g, code)
 
@@ -189,7 +187,7 @@ class CUDAStream:
                 cv2.CV_8UC1, cv2.CV_8UC1, (ksize, ksize), sigma
             )
             dst = cv2.cuda_GpuMat()
-            filt.apply(g, dst, stream=self.stream)
+            filt.apply(g, dst)
             return dst
         return cv2.GaussianBlur(g, (ksize, ksize), sigma)
 
@@ -197,14 +195,14 @@ class CUDAStream:
         if self.HAS_CV_CUDA:
             det = cv2.cuda.createCannyEdgeDetector(lo, hi)
             dst = cv2.cuda_GpuMat()
-            det.detect(g, dst, stream=self.stream)
+            det.detect(g, dst)
             return dst
         return cv2.Canny(g, lo, hi)
 
     def threshold(self, g, thresh, maxval):
         if self.HAS_CV_CUDA:
             dst = cv2.cuda_GpuMat()
-            cv2.cuda.threshold(g, thresh, maxval, cv2.THRESH_BINARY, dst=dst, stream=self.stream)
+            cv2.cuda.threshold(g, thresh, maxval, cv2.THRESH_BINARY, dst=dst)
             return dst
         _, out = cv2.threshold(g, thresh, maxval, cv2.THRESH_BINARY)
         return out
@@ -212,7 +210,7 @@ class CUDAStream:
     def bitwise_or(self, a, b):
         if self.HAS_CV_CUDA:
             dst = cv2.cuda_GpuMat()
-            cv2.cuda.bitwise_or(a, b, dst=dst, stream=self.stream)
+            cv2.cuda.bitwise_or(a, b, dst=dst)
             return dst
         return cv2.bitwise_or(a, b)
 
@@ -225,13 +223,12 @@ class CUDAStream:
     def warpPerspective(self, g, M, dsize):
         if self.HAS_CV_CUDA:
             dst = cv2.cuda_GpuMat()
-            cv2.cuda.warpPerspective(g, M, dsize, dst=dst, stream=self.stream)
+            cv2.cuda.warpPerspective(g, M, dsize, dst=dst)
             return dst
         return cv2.warpPerspective(g, M, dsize)
 
     def sync(self):
-        if self.HAS_CV_CUDA and self.stream:
-            self.stream.waitForCompletion()
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
