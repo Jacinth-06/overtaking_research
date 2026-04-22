@@ -222,7 +222,7 @@ def process_frame(frame, s, annotate: bool):
         # desired offset from left lane
         target_x = left_x + s.get("lane_offset", 140)
 
-        error = (target_x - w / 2.0) / (w / 2.0) *2.8 # normalise to [-1, 1]
+        error = (target_x - w / 2.0) / (w / 2.0) *4 # normalise to [-1, 1]
 
         now = time.time()
         dt  = max(now - pid_state["last_time"], 0.001)
