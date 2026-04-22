@@ -1,656 +1,886 @@
+#!/usr/bin/env python3
 """
-lane_follow.py — GPU-accelerated dual-lane follower + Flask dashboard
-Optimised for Jetson Nano 4 GB, black road with white lines on both sides.
+lane_following_jetson.py
+========================
+CUDA-GPU-accelerated lane following for NVIDIA Jetson platforms.
+Pipeline: frame → grayscale → Gaussian blur → (Canny + Binary) → OR combine
+          → morphology clean → bird-eye → histogram → lane center → PID → motor
 
-Detection strategy:
-  • HSV mask isolates white lane lines.
-  • ROI split into left zone / right zone.
-  • Largest contour in each zone → left_cx, right_cx.
-  • Both found → lane center = midpoint.
-  • One found  → lane center = inferred from detected line + lane_width.
-  • None found → hold last steer value until lane is found again.
-  • Error gain multiplied by 2 for sharper response.
+Flask server runs on port 5000 for real-time parameter tuning.
 
-Run:   python lane_follow.py
-Open:  http://<jetson-ip>:5000
+Lane type: black road bordered by white lines.
+
+Author: generated for Jetson Nano/Xavier/Orin
+Dependencies:
+    pip install flask opencv-python-headless numpy cupy-cuda12x
+    (use cupy-cuda11x if CUDA 11.x, or cupy-cuda12x for CUDA 12.x)
+    Motor control: adapt _send_motor_command() to your HAL (Adafruit, GPIO, ROS, etc.)
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Imports
+# ─────────────────────────────────────────────────────────────────────────────
 import cv2
 import numpy as np
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, Response, render_template_string, request, jsonify
+import logging
+import sys
+import signal
+import math
 
-from jetracer import JetRacer
+from flask import Flask, jsonify, request, render_template_string
+from collections import deque
 
-import os
-os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"        # Disable MSMF (Windows)
-# GStreamer MUST stay enabled — CSI camera outputs raw Bayer (RG10)
-# and needs nvarguscamerasrc for ISP debayering
-os.environ["OPENCV_VIDEOIO_PRIORITY_FFMPEG"] = "0"      # Disable FFMPEG
+# CuPy for CUDA-side ndarray ops (falls back to NumPy if unavailable)
+try:
+    import cupy as cp
+    _CUPY_OK = True
+except ImportError:
+    cp = np          # transparent fallback
+    _CUPY_OK = False
 
-app = Flask(__name__)
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("LanePilot")
 
-# ── CUDA availability check ───────────────────────────────────────────────────
-USE_CUDA = cv2.cuda.getCudaEnabledDeviceCount() > 0
-if USE_CUDA:
-    print("[init] CUDA device found — GPU path active")
-    _gpu_frame = cv2.cuda_GpuMat()
-    _gpu_hsv   = cv2.cuda_GpuMat()
-    _gpu_mask  = cv2.cuda_GpuMat()
-else:
-    print("[init] No CUDA device — falling back to CPU")
-    _gpu_frame = _gpu_hsv = _gpu_mask = None
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Shared mutable parameter store (thread-safe with a lock) ─────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+_param_lock = threading.Lock()
 
-# ── Config constants ──────────────────────────────────────────────────────────
-WIDTH, HEIGHT   = 320, 240          # lower res = less GPU/CPU work
-ENCODE_EVERY    = 3                  # encode JPEG only every Nth frame
-JPEG_QUALITY    = 30                 # lower = smaller payload, less CPU
-MJPEG_INTERVAL  = 1 / 15            # 15 fps to browser
-ROI_FRAC        = 0.65              # bottom 35% used as ROI
+PARAMS = {
+    # ── Camera ────────────────────────────────────────────────────────────────
+    "camera_index":         0,
+    "frame_width":          640,
+    "frame_height":         480,
+    "fps_cap":              30,
 
-# Pre-allocate morphological kernel (constant — no need to recreate per frame)
-MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # ── Gaussian blur ─────────────────────────────────────────────────────────
+    "blur_ksize":           5,       # must be odd
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-state = {
-    "h_lo": 0,  "h_hi": 180,
-    "s_lo": 0,  "s_hi": 92,
-    "v_lo": 216,  "v_hi": 255,
-    "kp": 0.55,   "ki": 0.003,  "kd": 0.25,
-    "speed": 0.46,
-    "enabled": False,
-    "min_contour_area": 300,
-    "lane_width": 325,             # expected pixel distance between lane lines
-    "lane_adjuster": -155,            # manual offset for lane center
-    "roi_side_limit": 0.0,
-    # telemetry (read-only from browser)
-    "error": 0.0,  "steer": 0.0,  "fps": 0,
-    "lane_found": False,
+    # ── Canny ─────────────────────────────────────────────────────────────────
+    "canny_lo":             50,
+    "canny_hi":             150,
+
+    # ── Binary threshold (for white-line detection) ────────────────────────────
+    "binary_thresh":        200,     # 0-255
+    "binary_maxval":        255,
+
+    # ── Morphology (post-OR combine) ──────────────────────────────────────────
+    "morph_ksize":          5,
+    "morph_iterations":     2,
+
+    # ── Bird-eye ROI quad (fractions of frame w/h) ────────────────────────────
+    # top-left, top-right, bot-right, bot-left  (y=0 = top)
+    "bev_tl_x": 0.40, "bev_tl_y": 0.55,
+    "bev_tr_x": 0.60, "bev_tr_y": 0.55,
+    "bev_br_x": 0.90, "bev_br_y": 0.90,
+    "bev_bl_x": 0.10, "bev_bl_y": 0.90,
+
+    # ── Histogram / lane detection ────────────────────────────────────────────
+    "hist_row_start":       0.5,     # fraction of BEV height to start summing
+    "lane_search_margin":   80,      # px around prior base
+    "lane_nwindows":        9,
+    "lane_minpix":          30,
+
+    # ── PID ───────────────────────────────────────────────────────────────────
+    "pid_kp":               0.55,
+    "pid_ki":               0.002,
+    "pid_kd":               0.18,
+    "pid_integral_clamp":   300.0,
+    "pid_output_clamp":     1.0,     # normalised steering ∈ [-1, 1]
+
+    # ── Motor / drive ─────────────────────────────────────────────────────────
+    "base_speed":           0.35,    # normalised [0, 1]
+    "speed_reduction_turn": 0.15,    # reduce speed by this fraction when steering
+
+    # ── Fail-safe ─────────────────────────────────────────────────────────────
+    "failsafe_no_lane_frames": 10,   # consecutive frames with no lane → stop
+    "failsafe_max_error":      300,  # |error| > this → emergency stop
+
+    # ── Debug ─────────────────────────────────────────────────────────────────
+    "show_debug_window":    False,
+    "log_telemetry":        True,
 }
 
-pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
-state_lock = threading.Lock()
 
-_last_steer = 0.0
-
-# Latest JPEG bytes for MJPEG stream
-frame_lock   = threading.Lock()
-latest_frame = None
-
-# Count of active MJPEG clients — skip annotation when 0
-stream_clients = 0
-clients_lock   = threading.Lock()
-
-# Async JPEG encoder (1 worker is enough; encoding is sequential)
-_encode_pool = ThreadPoolExecutor(max_workers=1)
+def get(key):
+    with _param_lock:
+        return PARAMS[key]
 
 
-# ── Camera ────────────────────────────────────────────────────────────────────
-def _gstreamer_pipeline(
-    sensor_id=0,
-    capture_width=1280, capture_height=720,
-    display_width=WIDTH, display_height=HEIGHT,
-    framerate=60, flip_method=0,
-):
-    """
-    Build a GStreamer pipeline string for nvarguscamerasrc (Jetson CSI cameras).
-    """
-    return (
-        f"nvarguscamerasrc sensor-id={sensor_id} ! "
-        f"video/x-raw(memory:NVMM), "
-        f"width=(int){capture_width}, height=(int){capture_height}, "
-        f"framerate=(fraction){framerate}/1, format=(string)NV12 ! "
-        f"nvvidconv flip-method={flip_method} ! "
-        f"video/x-raw, width=(int){display_width}, height=(int){display_height}, "
-        f"format=(string)BGRx ! "
-        f"videoconvert ! "
-        f"video/x-raw, format=(string)BGR ! "
-        f"appsink drop=1 max-buffers=1"
-    )
-
-def open_camera():
-    # --- Try CSI camera via GStreamer (nvarguscamerasrc) ---
-    gst = _gstreamer_pipeline()
-    print(f"[camera] Trying GStreamer pipeline:\n  {gst}")
-    cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-    if cap.isOpened():
-        print(f"[camera] CSI camera via nvarguscamerasrc {WIDTH}×{HEIGHT} OK")
-        return cap
-    print("[camera] GStreamer pipeline failed, trying USB fallback...")
-
-    # --- Fallback: USB camera ---
-    cap = cv2.VideoCapture(0)
-    if cap.isOpened():
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        print(f"[camera] USB /dev/video0 {WIDTH}×{HEIGHT} OK")
-        return cap
-
-    raise RuntimeError("No camera found (CSI and USB both failed)")
+def set_param(key, value):
+    with _param_lock:
+        if key in PARAMS:
+            PARAMS[key] = type(PARAMS[key])(value)
+            return True
+        return False
 
 
-# ── GPU HSV mask ──────────────────────────────────────────────────────────────
-def _make_gpu_hsv_mask():
-    probe = cv2.cuda_GpuMat()
-    probe.upload(np.zeros((1, 1, 3), dtype=np.uint8))
-    try:
-        result = cv2.cuda.cvtColor(probe, cv2.COLOR_BGR2HSV)
-        if result is not None and not result.empty():
-            print("[cuda] cvtColor: functional API (returns GpuMat)")
-            def _mask_functional(roi_bgr, lo, hi):
-                _gpu_frame.upload(roi_bgr)
-                hsv_gpu = cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV)
-                hsv_cpu = hsv_gpu.download()
-                return cv2.inRange(hsv_cpu, lo, hi)
-            return _mask_functional
-    except Exception:
-        pass
-
-    print("[cuda] cvtColor: in-place API (dst arg)")
-    def _mask_inplace(roi_bgr, lo, hi):
-        _gpu_frame.upload(roi_bgr)
-        cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV, _gpu_hsv)
-        hsv_cpu = _gpu_hsv.download()
-        return cv2.inRange(hsv_cpu, lo, hi)
-    return _mask_inplace
-
-def cpu_hsv_mask(roi_bgr, lo, hi):
-    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    return cv2.inRange(hsv, lo, hi)
-
-gpu_hsv_mask = _make_gpu_hsv_mask() if USE_CUDA else None
+# ─────────────────────────────────────────────────────────────────────────────
+# ── CUDA helpers ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+def _to_gpu(mat: np.ndarray):
+    """Upload numpy array to CuPy array (no-op if CuPy absent)."""
+    if _CUPY_OK:
+        return cp.asarray(mat)
+    return mat
 
 
-# ── Dual-lane detection + PID ─────────────────────────────────────────────────
-def process_frame(frame, s, annotate: bool):
-    global _last_steer
-    h, w = frame.shape[:2]
-    roi_top = int(h * ROI_FRAC)
+def _to_cpu(mat) -> np.ndarray:
+    """Download CuPy array to numpy (no-op if CuPy absent)."""
+    if _CUPY_OK and isinstance(mat, cp.ndarray):
+        return cp.asnumpy(mat)
+    return mat
 
-    # Horizontal ROI cropping
-    x_start = int(w * s["roi_side_limit"])
-    x_end   = w - x_start
-    roi = frame[roi_top:h, x_start:x_end]
 
-    lo = np.array([s["h_lo"], s["s_lo"], s["v_lo"]], dtype=np.uint8)
-    hi = np.array([s["h_hi"], s["s_hi"], s["v_hi"]], dtype=np.uint8)
+# ─────────────────────────────────────────────────────────────────────────────
+# ── OpenCV CUDA stream wrapper ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+class CUDAStream:
+    """Thin wrapper: uses cv2.cuda if available, else plain cv2."""
 
-    # --- Mask: GPU or CPU ---
-    mask = gpu_hsv_mask(roi, lo, hi) if gpu_hsv_mask is not None else cpu_hsv_mask(roi, lo, hi)
+    HAS_CV_CUDA = hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
 
-    # --- Morphological cleanup (cached kernel) ---
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  MORPH_KERNEL)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
-
-    # --- Contours ---
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    roi_w       = x_end - x_start
-    mid_x       = roi_w // 2
-    min_area    = s["min_contour_area"]
-    lane_width_px = s["lane_width"]
-
-    # Classify contours into left/right by centroid relative to ROI center
-    # 1. Gather all valid lines
-    valid_contours = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area:
-            continue
-        M = cv2.moments(cnt)
-        if M["m00"] <= 0:
-            continue
-        cx = int(M["m10"] / M["m00"]) + x_start # absolute X mapping
-        cy = int(M["m01"] / M["m00"])
-        valid_contours.append((area, cx, cy))
-
-    # 2. Sort by area (descending) to find the two most prominent lines
-    valid_contours.sort(key=lambda x: x[0], reverse=True)
-    top_lines = valid_contours[:2]
-
-    left_cx, right_cx, left_cy, right_cy = None, None, None, None
-
-    # Get the last known lane center to intelligently classify a single line
-    # (Defaults to center of screen if starting fresh)
-    last_center = pid_state.get("last_center", w // 2)
-
-    # 3. Smart Classification
-    if len(top_lines) == 2:
-        # If we see two lines, the one with the smaller X is definitively Left
-        top_lines.sort(key=lambda x: x[1])
-        _, left_cx, left_cy = top_lines[0]
-        _, right_cx, right_cy = top_lines[1]
-        
-    elif len(top_lines) == 1:
-        # If we only see ONE line, compare it to the LAST KNOWN center
-        _, cx, cy = top_lines[0]
-        
-        if cx < last_center:
-            # It is to the left of the lane center, so it must be the left line
-            left_cx, left_cy = cx, cy
+    def __init__(self):
+        if self.HAS_CV_CUDA:
+            self.stream = cv2.cuda.Stream()
+            log.info("OpenCV CUDA enabled – GPU stream created.")
         else:
-            # It is to the right of the lane center, so it must be the right line
-            right_cx, right_cy = cx, cy
+            self.stream = None
+            log.warning("OpenCV CUDA NOT available – falling back to CPU cv2.")
 
-    # 4. Compute lane center
-    l_det, r_det = left_cx is not None, right_cx is not None
-    lane_found = l_det or r_det
+    # ── Upload / Download ────────────────────────────────────────────────────
+    def upload(self, mat: np.ndarray) -> "GpuMat | np.ndarray":
+        if self.HAS_CV_CUDA:
+            g = cv2.cuda_GpuMat()
+            g.upload(mat, self.stream)
+            return g
+        return mat
 
-    if l_det and r_det:
-        lane_center = (left_cx + right_cx) // 2
-    elif l_det:
-        lane_center = left_cx + lane_width_px // 2
-    elif r_det:
-        lane_center = right_cx - lane_width_px // 2
-    else:
-        lane_center = w // 2   # fallback
+    def download(self, g) -> np.ndarray:
+        if self.HAS_CV_CUDA and isinstance(g, cv2.cuda_GpuMat):
+            return g.download(self.stream)
+        return g
 
-    # 5. MEMORY UPDATE: Save this center for the next frame's logic
-    if lane_found:
-        pid_state["last_center"] = lane_center # fallback (won't be used for error)
+    # ── Per-op wrappers ──────────────────────────────────────────────────────
+    def cvtColor(self, g, code):
+        if self.HAS_CV_CUDA:
+            dst = cv2.cuda_GpuMat()
+            cv2.cuda.cvtColor(g, code, dst=dst, stream=self.stream)
+            return dst
+        return cv2.cvtColor(g, code)
 
-    # Apply lane adjuster offset
-    lane_center += s.get("lane_adjuster", 0)
+    def gaussianBlur(self, g, ksize, sigma):
+        if self.HAS_CV_CUDA:
+            filt = cv2.cuda.createGaussianFilter(
+                cv2.CV_8UC1, cv2.CV_8UC1, (ksize, ksize), sigma
+            )
+            dst = cv2.cuda_GpuMat()
+            filt.apply(g, dst, stream=self.stream)
+            return dst
+        return cv2.GaussianBlur(g, (ksize, ksize), sigma)
 
-    # --- Error & steering ---
-    if lane_found:
-        error = (lane_center - w // 2) / (w // 2) * 3  # ×2 gain
+    def canny(self, g, lo, hi):
+        if self.HAS_CV_CUDA:
+            det = cv2.cuda.createCannyEdgeDetector(lo, hi)
+            dst = cv2.cuda_GpuMat()
+            det.detect(g, dst, stream=self.stream)
+            return dst
+        return cv2.Canny(g, lo, hi)
 
-        # --- PID ---
-        now = time.time()
-        dt  = max(now - pid_state["last_time"], 0.001)
-        pid_state["integral"]  += error * dt
-        pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
-        derivative              = (error - pid_state["last_error"]) / dt
-        pid_state["last_error"] = error
-        pid_state["last_time"]  = now
+    def threshold(self, g, thresh, maxval):
+        if self.HAS_CV_CUDA:
+            dst = cv2.cuda_GpuMat()
+            cv2.cuda.threshold(g, thresh, maxval, cv2.THRESH_BINARY, dst=dst, stream=self.stream)
+            return dst
+        _, out = cv2.threshold(g, thresh, maxval, cv2.THRESH_BINARY)
+        return out
 
-        steer = (s["kp"] * error
-               + s["ki"] * pid_state["integral"]
-               + s["kd"] * derivative)
-        steer = max(-1.0, min(1.0, steer))
-        _last_steer = steer
-    else:
-        # Both lines lost → hold last steer
-        error = 0.0
-        steer = _last_steer
+    def bitwise_or(self, a, b):
+        if self.HAS_CV_CUDA:
+            dst = cv2.cuda_GpuMat()
+            cv2.cuda.bitwise_or(a, b, dst=dst, stream=self.stream)
+            return dst
+        return cv2.bitwise_or(a, b)
 
-    # --- Annotate ---
-    if annotate:
-        annotated = frame.copy()
+    def morphologyEx(self, g, op, kernel, iters):
+        """Morphology runs on CPU (cv2.cuda morphology is limited)."""
+        cpu = self.download(g)
+        out = cv2.morphologyEx(cpu, op, kernel, iterations=iters)
+        return self.upload(out)
 
-        # ROI boundary line
-        cv2.line(annotated, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
+    def warpPerspective(self, g, M, dsize):
+        if self.HAS_CV_CUDA:
+            dst = cv2.cuda_GpuMat()
+            cv2.cuda.warpPerspective(g, M, dsize, dst=dst, stream=self.stream)
+            return dst
+        return cv2.warpPerspective(g, M, dsize)
 
-        # Horizontal crop lines
-        cv2.line(annotated, (x_start, roi_top), (x_start, h), (255, 0, 255), 1)
-        cv2.line(annotated, (x_end, roi_top), (x_end, h), (255, 0, 255), 1)
-
-        # Mask overlay
-        mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        mask_3ch[:, :, 0] = 0
-        annotated[roi_top:h, x_start:x_end] = cv2.addWeighted(
-            annotated[roi_top:h, x_start:x_end], 0.7, mask_3ch, 0.3, 0)
-
-        # Lane markers
-        if l_det:
-            cv2.circle(annotated, (left_cx, roi_top + left_cy), 8, (0, 255, 0), -1)
-            cv2.circle(annotated, (left_cx, roi_top + left_cy), 8, (255, 255, 255), 2)
-        if r_det:
-            cv2.circle(annotated, (right_cx, roi_top + right_cy), 8, (0, 255, 0), -1)
-            cv2.circle(annotated, (right_cx, roi_top + right_cy), 8, (255, 255, 255), 2)
-
-        # Lane center marker (cyan)
-        if lane_found:
-            cy_mid = roi_top + (h - roi_top) // 2
-            cv2.circle(annotated, (lane_center, cy_mid), 6, (255, 200, 0), -1)
-
-        # Frame center line
-        cv2.line(annotated, (w // 2, roi_top), (w // 2, h), (0, 200, 255), 1)
-
-        # Steer arrow
-        arrow_x = int(w // 2 + steer * (w // 3))
-        cv2.arrowedLine(annotated, (w // 2, 22), (arrow_x, 22),
-                        (0, 140, 255), 2, tipLength=0.35)
-
-        # Status text
-        status = "DRIVING" if s["enabled"] else "STOPPED"
-        color  = (0, 220, 60) if s["enabled"] else (60, 60, 220)
-        cv2.putText(annotated, status, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        cv2.putText(annotated, f"e{error:+.2f} s{steer:+.2f}", (5, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
-        cv2.putText(annotated, f"fps {s['fps']}", (5, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
-
-        lane_col = (0, 220, 60) if lane_found else (0, 60, 220)
-        cv2.putText(annotated, "OK" if lane_found else "NO", (w - 30, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, lane_col, 1)
-
-    else:
-        annotated = frame   # no copy needed
-
-    return annotated, error, steer, lane_found
+    def sync(self):
+        if self.HAS_CV_CUDA and self.stream:
+            self.stream.waitForCompletion()
 
 
-# ── Async JPEG encode ─────────────────────────────────────────────────────────
-def _do_encode(img):
-    ret, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    if not ret:
-        return
-    with frame_lock:
-        global latest_frame
-        latest_frame = jpeg.tobytes()
+# ─────────────────────────────────────────────────────────────────────────────
+# ── PID Controller ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+class PIDController:
+    def __init__(self):
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._prev_time = time.monotonic()
+
+    def reset(self):
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._prev_time = time.monotonic()
+
+    def compute(self, error: float) -> float:
+        now = time.monotonic()
+        dt = max(now - self._prev_time, 1e-4)
+        self._prev_time = now
+
+        kp = get("pid_kp")
+        ki = get("pid_ki")
+        kd = get("pid_kd")
+        i_clamp = get("pid_integral_clamp")
+        o_clamp = get("pid_output_clamp")
+
+        self._integral += error * dt
+        self._integral = max(-i_clamp, min(i_clamp, self._integral))
+
+        derivative = (error - self._prev_error) / dt
+        self._prev_error = error
+
+        output = kp * error + ki * self._integral + kd * derivative
+        return max(-o_clamp, min(o_clamp, output))
 
 
-# ── Control loop ──────────────────────────────────────────────────────────────
-def control_loop(car: JetRacer):
-    cap = open_camera()
-    fps_counter, fps_time = 0, time.time()
-    frame_idx = 0
-    print("[loop] Control loop started")
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Motor interface (STUB – adapt to your hardware) ───────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+def _send_motor_command(speed: float, steering: float):
+    """
+    Send drive command to motor controller.
+    speed    ∈ [0, 1]   (forward)
+    steering ∈ [-1, 1]  (negative = left, positive = right)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.01)
-            continue
+    Replace the body with your actual HAL:
+      - Adafruit MotorHAT
+      - RPi.GPIO PWM
+      - ROS publisher
+      - Serial to Arduino
+      - jetson-gpio PWM channels
+    """
+    # Example: differential drive
+    left  = speed - steering * get("speed_reduction_turn")
+    right = speed + steering * get("speed_reduction_turn")
+    left  = max(0.0, min(1.0, left))
+    right = max(0.0, min(1.0, right))
+    # TODO: write left/right to your motor HAL here
+    # log.debug(f"Motor L={left:.3f} R={right:.3f}")
 
-        if len(frame.shape) != 3:
-            continue
 
-        if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
-            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+def _emergency_stop():
+    _send_motor_command(0.0, 0.0)
+    log.warning("⛔ Emergency stop triggered.")
 
-        with state_lock:
-            s_copy = dict(state)
 
-        with clients_lock:
-            has_clients = stream_clients > 0
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Bird-eye perspective transform (cached, rebuilt on param change) ──────────
+# ─────────────────────────────────────────────────────────────────────────────
+class BirdEye:
+    def __init__(self, stream: CUDAStream):
+        self._stream = stream
+        self._M = None
+        self._Minv = None
+        self._last_params = None
+        self._dsize = None
 
-        do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
-        annotated, error, steer, lane_found = process_frame(frame, s_copy, do_annotate)
+    def _build(self, W, H):
+        p = {
+            k: get(k) for k in (
+                "bev_tl_x", "bev_tl_y", "bev_tr_x", "bev_tr_y",
+                "bev_br_x", "bev_br_y", "bev_bl_x", "bev_bl_y",
+            )
+        }
+        if p == self._last_params:
+            return
 
-        if do_annotate:
-            _encode_pool.submit(_do_encode, annotated)
+        src = np.float32([
+            [p["bev_tl_x"] * W, p["bev_tl_y"] * H],
+            [p["bev_tr_x"] * W, p["bev_tr_y"] * H],
+            [p["bev_br_x"] * W, p["bev_br_y"] * H],
+            [p["bev_bl_x"] * W, p["bev_bl_y"] * H],
+        ])
+        dst = np.float32([
+            [0,   0],
+            [W,   0],
+            [W,   H],
+            [0,   H],
+        ])
+        self._M    = cv2.getPerspectiveTransform(src, dst)
+        self._Minv = cv2.getPerspectiveTransform(dst, src)
+        self._dsize = (W, H)
+        self._last_params = p
 
-        fps_counter += 1
-        if time.time() - fps_time >= 1.0:
-            with state_lock:
-                state["fps"] = fps_counter
-            fps_counter, fps_time = 0, time.time()
+    def warp(self, g, W, H):
+        self._build(W, H)
+        return self._stream.warpPerspective(g, self._M, self._dsize)
 
-        if s_copy["enabled"]:
-            car.steer(steer)
-            car.forward(s_copy["speed"])
+    @property
+    def Minv(self):
+        return self._Minv
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Lane detector (histogram + sliding windows) ───────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+class LaneDetector:
+    def __init__(self):
+        self._left_base_prev  = None
+        self._right_base_prev = None
+
+    def detect(self, bev_binary: np.ndarray):
+        """
+        bev_binary: grayscale/binary BEV image (CPU ndarray, 0/255).
+        Returns: (center_x, left_fit, right_fit, debug_img)
+                 center_x = None if detection fails.
+        """
+        H, W = bev_binary.shape
+        row_start = int(get("hist_row_start") * H)
+        margin    = int(get("lane_search_margin"))
+        nwindows  = int(get("lane_nwindows"))
+        minpix    = int(get("lane_minpix"))
+
+        # ── Histogram on lower half ───────────────────────────────────────────
+        hist = np.sum(bev_binary[row_start:, :].astype(np.int32), axis=0)
+        midpoint = W // 2
+
+        # Left / right peaks
+        left_base  = int(np.argmax(hist[:midpoint]))
+        right_base = int(np.argmax(hist[midpoint:]) + midpoint)
+
+        # Smooth with previous frame (simple IIR)
+        alpha = 0.6
+        if self._left_base_prev is not None:
+            left_base  = int(alpha * left_base  + (1 - alpha) * self._left_base_prev)
+            right_base = int(alpha * right_base + (1 - alpha) * self._right_base_prev)
+        self._left_base_prev  = left_base
+        self._right_base_prev = right_base
+
+        # ── Sliding windows ───────────────────────────────────────────────────
+        win_h = H // nwindows
+        nonzero   = bev_binary.nonzero()
+        nzy, nzx  = np.array(nonzero[0]), np.array(nonzero[1])
+
+        left_cur, right_cur = left_base, right_base
+        left_lane_idx, right_lane_idx = [], []
+
+        dbg = cv2.cvtColor(bev_binary, cv2.COLOR_GRAY2BGR)
+
+        for w in range(nwindows):
+            y_lo = H - (w + 1) * win_h
+            y_hi = H - w * win_h
+            xl_lo, xl_hi = left_cur  - margin, left_cur  + margin
+            xr_lo, xr_hi = right_cur - margin, right_cur + margin
+
+            cv2.rectangle(dbg, (xl_lo, y_lo), (xl_hi, y_hi), (0, 255, 0), 1)
+            cv2.rectangle(dbg, (xr_lo, y_lo), (xr_hi, y_hi), (0, 0, 255), 1)
+
+            good_l = ((nzy >= y_lo) & (nzy < y_hi) &
+                      (nzx >= xl_lo) & (nzx < xl_hi)).nonzero()[0]
+            good_r = ((nzy >= y_lo) & (nzy < y_hi) &
+                      (nzx >= xr_lo) & (nzx < xr_hi)).nonzero()[0]
+
+            left_lane_idx.append(good_l)
+            right_lane_idx.append(good_r)
+
+            if len(good_l) > minpix:
+                left_cur  = int(np.mean(nzx[good_l]))
+            if len(good_r) > minpix:
+                right_cur = int(np.mean(nzx[good_r]))
+
+        left_idx  = np.concatenate(left_lane_idx)
+        right_idx = np.concatenate(right_lane_idx)
+
+        if len(left_idx) < 5 or len(right_idx) < 5:
+            return None, None, None, dbg   # detection failed
+
+        # ── Polynomial fit (2nd order) ────────────────────────────────────────
+        ly, lx = nzy[left_idx],  nzx[left_idx]
+        ry, rx = nzy[right_idx], nzx[right_idx]
+
+        try:
+            left_fit  = np.polyfit(ly, lx, 2)
+            right_fit = np.polyfit(ry, rx, 2)
+        except np.linalg.LinAlgError:
+            return None, None, None, dbg
+
+        # ── Lane centre at bottom ─────────────────────────────────────────────
+        ploty = H - 1
+        left_x  = np.polyval(left_fit,  ploty)
+        right_x = np.polyval(right_fit, ploty)
+        center_x = (left_x + right_x) / 2.0
+
+        # Draw fitted lines
+        ys = np.linspace(0, H - 1, H)
+        lxs = np.polyval(left_fit,  ys).astype(int)
+        rxs = np.polyval(right_fit, ys).astype(int)
+        for y, lx_, rx_ in zip(ys.astype(int), lxs, rxs):
+            if 0 <= lx_ < W:
+                cv2.circle(dbg, (lx_, y), 1, (255, 200, 0), -1)
+            if 0 <= rx_ < W:
+                cv2.circle(dbg, (rx_, y), 1, (0, 200, 255), -1)
+
+        return center_x, left_fit, right_fit, dbg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+class LanePilot:
+    def __init__(self):
+        self._stream   = CUDAStream()
+        self._bev      = BirdEye(self._stream)
+        self._detector = LaneDetector()
+        self._pid      = PIDController()
+        self._running  = False
+
+        self._no_lane_count = 0
+        self._morph_kernel  = None
+        self._morph_ksize   = None
+
+        # Telemetry ring-buffer (for Flask dashboard)
+        self._telem_lock = threading.Lock()
+        self._telem = deque(maxlen=200)
+
+    # ── Morphology kernel (cached) ────────────────────────────────────────────
+    def _get_morph_kernel(self):
+        ksize = get("morph_ksize")
+        if ksize != self._morph_ksize:
+            self._morph_kernel = cv2.getStructuringElement(
+                cv2.MORPH_RECT, (ksize, ksize)
+            )
+            self._morph_ksize = ksize
+        return self._morph_kernel
+
+    # ── Single frame processing ───────────────────────────────────────────────
+    def _process_frame(self, frame: np.ndarray):
+        H, W = frame.shape[:2]
+
+        # 1. Upload to GPU
+        g_bgr = self._stream.upload(frame)
+
+        # 2. Grayscale
+        g_gray = self._stream.cvtColor(g_bgr, cv2.COLOR_BGR2GRAY)
+
+        # 3. Gaussian blur
+        ksize = get("blur_ksize") | 1    # ensure odd
+        g_blur = self._stream.gaussianBlur(g_gray, ksize, 0)
+
+        # 4a. Canny edge
+        g_canny = self._stream.canny(g_blur, get("canny_lo"), get("canny_hi"))
+
+        # 4b. Binary threshold (white lines)
+        g_bin = self._stream.threshold(g_blur, get("binary_thresh"), get("binary_maxval"))
+
+        # 5. OR combine
+        g_combined = self._stream.bitwise_or(g_canny, g_bin)
+
+        # 6. Morphology clean
+        g_morph = self._stream.morphologyEx(
+            g_combined, cv2.MORPH_CLOSE,
+            self._get_morph_kernel(),
+            get("morph_iterations")
+        )
+
+        # 7. Bird-eye
+        g_bev = self._bev.warp(g_morph, W, H)
+
+        # 8. Sync & download for CPU lane algo
+        self._stream.sync()
+        bev_cpu = self._stream.download(g_bev)
+
+        # 9. Histogram + lane detection
+        center_x, left_fit, right_fit, dbg = self._detector.detect(bev_cpu)
+
+        # 10. PID
+        if center_x is None:
+            self._no_lane_count += 1
+            if self._no_lane_count >= get("failsafe_no_lane_frames"):
+                _emergency_stop()
+            error   = 0.0
+            steering = 0.0
         else:
-            car.stop()
+            self._no_lane_count = 0
+            frame_cx = W / 2.0
+            error    = center_x - frame_cx
 
-        with state_lock:
-            state["error"]      = round(error, 3)
-            state["steer"]      = round(steer, 3)
-            state["lane_found"] = lane_found
+            if abs(error) > get("failsafe_max_error"):
+                _emergency_stop()
+                return None, dbg
 
-        frame_idx += 1
+            steering = self._pid.compute(error)
 
-    cap.release()
+        # 11. Motor command
+        speed = get("base_speed")
+        _send_motor_command(speed, steering)
+
+        # 12. Telemetry
+        t = {
+            "ts":        time.time(),
+            "error":     round(float(error), 2) if center_x is not None else None,
+            "steering":  round(float(steering), 4),
+            "speed":     round(float(speed), 4),
+            "no_lane":   self._no_lane_count,
+            "center_x":  round(float(center_x), 1) if center_x is not None else None,
+        }
+        with self._telem_lock:
+            self._telem.append(t)
+
+        if get("log_telemetry"):
+            log.debug(
+                f"err={t['error']} steer={t['steering']:.3f} cx={t['center_x']}"
+            )
+
+        return t, dbg
+
+    # ── Run loop ──────────────────────────────────────────────────────────────
+    def run(self):
+        cap = cv2.VideoCapture(get("camera_index"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  get("frame_width"))
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, get("frame_height"))
+        cap.set(cv2.CAP_PROP_FPS,          get("fps_cap"))
+
+        if not cap.isOpened():
+            log.error("Cannot open camera.")
+            return
+
+        self._running = True
+        log.info("Lane pilot started.")
+        fps_cap = get("fps_cap")
+
+        try:
+            while self._running:
+                t0 = time.monotonic()
+                ok, frame = cap.read()
+                if not ok:
+                    log.warning("Camera read failed.")
+                    time.sleep(0.1)
+                    continue
+
+                telem, dbg = self._process_frame(frame)
+
+                if get("show_debug_window") and dbg is not None:
+                    cv2.imshow("BEV Debug", dbg)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                # Frame rate cap
+                elapsed = time.monotonic() - t0
+                sleep_t = (1.0 / fps_cap) - elapsed
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+
+        finally:
+            self._running = False
+            _emergency_stop()
+            cap.release()
+            cv2.destroyAllWindows()
+            log.info("Lane pilot stopped.")
+
+    def stop(self):
+        self._running = False
+
+    def get_telemetry(self):
+        with self._telem_lock:
+            return list(self._telem)
 
 
-# ── Flask / dashboard ───────────────────────────────────────────────────────
-DASHBOARD_HTML = """<!DOCTYPE html>
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Flask tuning server ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+DASHBOARD_HTML = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>JetRacer Lane Follower</title>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>LanePilot · Jetson Tuner</title>
 <style>
-  :root {
-    --bg: #0e1117; --surface: #161b27; --border: #2a3040;
-    --accent: #00d4aa; --warn: #ffb020; --danger: #ff4d4d;
-    --text: #e8ecf1; --muted: #6b7a99;
-    --font: 'JetBrains Mono', 'Fira Mono', monospace;
+  :root{
+    --bg:#0a0c10;--card:#12151c;--border:#1e2430;
+    --accent:#00e5ff;--warn:#ff6b35;--ok:#00e676;
+    --text:#c9d1e0;--dim:#556;
+    --font:'JetBrains Mono',monospace;
   }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: var(--font);
-         display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 1rem; }
-  h1 { font-size: 1rem; letter-spacing: .15em; color: var(--accent);
-       text-transform: uppercase; margin-bottom: 1rem; }
-  .grid { display: grid; grid-template-columns: 1fr 340px; gap: 1rem; width: 100%; max-width: 1100px; }
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; }
-  .card h2 { font-size: .7rem; letter-spacing: .12em; color: var(--muted); text-transform: uppercase;
-             margin-bottom: .75rem; }
-  img#feed { width: 100%; border-radius: 6px; display: block; background: #000; min-height: 180px; }
-  .status-bar { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-bottom: .75rem; }
-  .stat { display: flex; flex-direction: column; }
-  .stat-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
-  .stat-lbl { font-size: .65rem; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
-  .slider-row { display: flex; align-items: center; gap: .5rem; margin-bottom: .55rem; }
-  .slider-row label { font-size: .7rem; color: var(--muted); width: 65px; flex-shrink: 0; }
-  .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
-  .slider-row .val { font-size: .75rem; width: 45px; text-align: right; color: var(--text); }
-  .btn-row { display: flex; gap: .5rem; margin-top: .75rem; }
-  button { padding: .45rem 1.1rem; border: none; border-radius: 6px; cursor: pointer;
-           font-family: var(--font); font-size: .8rem; font-weight: 600; letter-spacing: .04em; }
-  #btn-go   { background: var(--accent); color: #061612; }
-  #btn-stop { background: var(--danger); color: #fff; }
-  #btn-go:hover   { filter: brightness(1.1); }
-  #btn-stop:hover { filter: brightness(1.1); }
-  .error-track { position: relative; height: 18px; background: var(--border);
-                 border-radius: 9px; margin-top: .5rem; overflow: hidden; }
-  #error-bar { position: absolute; height: 100%; width: 4px; background: var(--accent);
-               left: 50%; transform: translateX(-50%); transition: left .1s; border-radius: 9px; }
-  .divider { border: none; border-top: 1px solid var(--border); margin: .75rem 0; }
-  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;min-height:100vh}
+  header{
+    background:linear-gradient(90deg,#001a26,#000c14);
+    border-bottom:1px solid var(--border);
+    padding:14px 24px;display:flex;align-items:center;gap:14px;
+  }
+  header .logo{font-size:20px;font-weight:700;color:var(--accent);letter-spacing:2px}
+  header .sub{color:var(--dim);font-size:11px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);animation:pulse 1.8s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .grid{display:grid;grid-template-columns:300px 1fr;gap:1px;background:var(--border);min-height:calc(100vh - 53px)}
+  .panel{background:var(--card);padding:20px;overflow-y:auto}
+  h2{color:var(--accent);font-size:11px;letter-spacing:3px;text-transform:uppercase;margin-bottom:16px;border-bottom:1px solid var(--border);padding-bottom:8px}
+  .group{margin-bottom:22px}
+  .group-label{color:var(--dim);font-size:10px;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+  .row label{color:var(--text);flex:1;font-size:12px}
+  .row input[type=range]{flex:1.2;accent-color:var(--accent)}
+  .row .val{width:60px;text-align:right;color:var(--accent);font-size:12px}
+  .btn{
+    background:transparent;border:1px solid var(--accent);color:var(--accent);
+    padding:7px 16px;border-radius:3px;cursor:pointer;font-family:var(--font);
+    font-size:12px;letter-spacing:1px;transition:.2s;
+  }
+  .btn:hover{background:var(--accent);color:#000}
+  .btn.stop{border-color:var(--warn);color:var(--warn)}
+  .btn.stop:hover{background:var(--warn);color:#000}
+  .telem-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:20px}
+  .card{background:#0d1018;border:1px solid var(--border);border-radius:4px;padding:14px}
+  .card .lbl{color:var(--dim);font-size:10px;letter-spacing:2px;text-transform:uppercase}
+  .card .big{font-size:26px;font-weight:700;color:var(--accent);margin-top:4px}
+  .card .big.warn{color:var(--warn)}
+  canvas{width:100%;height:140px;display:block;margin-top:10px;border:1px solid var(--border);border-radius:3px}
+  #status{font-size:11px;color:var(--dim);margin-top:14px;min-height:16px}
+  @media(max-width:700px){.grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-<h1>&#9675; JetRacer &#183; Lane Follow Dashboard</h1>
+<header>
+  <div class="dot"></div>
+  <div>
+    <div class="logo">LANEPILOT</div>
+    <div class="sub">Jetson CUDA lane follower · real-time tuner</div>
+  </div>
+</header>
+
 <div class="grid">
-  <div class="card">
-    <h2>Camera feed (annotated)</h2>
-    <img id="feed" src="/video_feed" alt="camera">
-    <div class="status-bar" style="margin-top:.75rem">
-      <div class="stat"><span class="stat-val" id="v-fps">0</span><span class="stat-lbl">fps</span></div>
-      <div class="stat"><span class="stat-val" id="v-err">0.00</span><span class="stat-lbl">error</span></div>
-      <div class="stat"><span class="stat-val" id="v-str">0.00</span><span class="stat-lbl">steer</span></div>
-      <div class="stat"><span class="stat-val" id="v-lane">—</span><span class="stat-lbl">lane</span></div>
-    </div>
-    <div class="error-track" title="Lane error (centre = 0)">
-      <div id="error-bar"></div>
-    </div>
+<!-- ── LEFT: PARAMETER PANEL ──────────────────────────── -->
+<div class="panel">
+  <h2>Parameters</h2>
+
+  <div class="group">
+    <div class="group-label">Vision</div>
+    <div class="row"><label>Blur kernel</label><input type="range" id="blur_ksize" min="1" max="21" step="2" value="5"><span class="val" id="v_blur_ksize">5</span></div>
+    <div class="row"><label>Canny lo</label><input type="range" id="canny_lo" min="0" max="255" value="50"><span class="val" id="v_canny_lo">50</span></div>
+    <div class="row"><label>Canny hi</label><input type="range" id="canny_hi" min="0" max="255" value="150"><span class="val" id="v_canny_hi">150</span></div>
+    <div class="row"><label>Binary threshold</label><input type="range" id="binary_thresh" min="0" max="255" value="200"><span class="val" id="v_binary_thresh">200</span></div>
+    <div class="row"><label>Morph kernel</label><input type="range" id="morph_ksize" min="1" max="21" step="2" value="5"><span class="val" id="v_morph_ksize">5</span></div>
+    <div class="row"><label>Morph iterations</label><input type="range" id="morph_iterations" min="1" max="5" value="2"><span class="val" id="v_morph_iterations">2</span></div>
   </div>
-  <div class="card">
-    <h2>Drive</h2>
-    <div class="slider-row">
-      <label>Speed</label>
-      <input type="range" id="speed" min="0" max="60" value="15" step="1">
-      <span class="val" id="v-speed">0.15</span>
-    </div>
-    <div class="btn-row">
-      <button id="btn-go"   onclick="setEnabled(true)">&#9654; GO</button>
-      <button id="btn-stop" onclick="setEnabled(false)">&#9632; STOP</button>
-    </div>
-    <hr class="divider">
-    <h2>PID gains</h2>
-    <div class="slider-row">
-      <label>Kp</label>
-      <input type="range" id="kp" min="0" max="1" value="0.55" step="0.01">
-      <span class="val" id="v-kp">0.55</span>
-    </div>
-    <div class="slider-row">
-      <label>Ki</label>
-      <input type="range" id="ki" min="0" max="0.05" value="0.003" step="0.001">
-      <span class="val" id="v-ki">0.003</span>
-    </div>
-    <div class="slider-row">
-      <label>Kd</label>
-      <input type="range" id="kd" min="0" max="0.5" value="0.25" step="0.01">
-      <span class="val" id="v-kd">0.25</span>
-    </div>
-    <hr class="divider">
-    <h2>Lane detection</h2>
-    <div class="slider-row">
-      <label>Lane W</label>
-      <input type="range" id="lane_width" min="50" max="700" value="200" step="5">
-      <span class="val" id="v-lane_width">200</span>
-    </div>
-    <div class="slider-row">
-      <label>Adjuster</label>
-      <input type="range" id="lane_adjuster" min="-700" max="700" value="0" step="5">
-      <span class="val" id="v-lane_adjuster">0</span>
-    </div>
-    <div class="slider-row">
-      <label>Side Crop</label>
-      <input type="range" id="roi_side_limit" min="0" max="0.45" value="0.0" step="0.01">
-      <span class="val" id="v-roi_side_limit">0.0</span>
-    </div>
-    <div class="slider-row">
-      <label>Min area</label>
-      <input type="range" id="min_contour_area" min="50" max="5000" value="300" step="50">
-      <span class="val" id="v-min_contour_area">300</span>
-    </div>
-    <hr class="divider">
-    <h2>HSV mask</h2>
-    <div class="slider-row">
-      <label>H lo</label>
-      <input type="range" id="h_lo" min="0" max="179" value="0" step="1">
-      <span class="val" id="v-h_lo">0</span>
-    </div>
-    <div class="slider-row">
-      <label>H hi</label>
-      <input type="range" id="h_hi" min="0" max="179" value="180" step="1">
-      <span class="val" id="v-h_hi">180</span>
-    </div>
-    <div class="slider-row">
-      <label>S lo</label>
-      <input type="range" id="s_lo" min="0" max="255" value="0" step="1">
-      <span class="val" id="v-s_lo">0</span>
-    </div>
-    <div class="slider-row">
-      <label>S hi</label>
-      <input type="range" id="s_hi" min="0" max="255" value="50" step="1">
-      <span class="val" id="v-s_hi">50</span>
-    </div>
-    <div class="slider-row">
-      <label>V lo</label>
-      <input type="range" id="v_lo" min="0" max="255" value="200" step="1">
-      <span class="val" id="v-v_lo">200</span>
-    </div>
-    <div class="slider-row">
-      <label>V hi</label>
-      <input type="range" id="v_hi" min="0" max="255" value="255" step="1">
-      <span class="val" id="v-v_hi">255</span>
-    </div>
+
+  <div class="group">
+    <div class="group-label">PID</div>
+    <div class="row"><label>Kp</label><input type="range" id="pid_kp" min="0" max="2" step="0.01" value="0.55"><span class="val" id="v_pid_kp">0.55</span></div>
+    <div class="row"><label>Ki</label><input type="range" id="pid_ki" min="0" max="0.1" step="0.001" value="0.002"><span class="val" id="v_pid_ki">0.002</span></div>
+    <div class="row"><label>Kd</label><input type="range" id="pid_kd" min="0" max="1" step="0.01" value="0.18"><span class="val" id="v_pid_kd">0.18</span></div>
   </div>
+
+  <div class="group">
+    <div class="group-label">Drive</div>
+    <div class="row"><label>Base speed</label><input type="range" id="base_speed" min="0" max="1" step="0.01" value="0.35"><span class="val" id="v_base_speed">0.35</span></div>
+    <div class="row"><label>Turn reduction</label><input type="range" id="speed_reduction_turn" min="0" max="0.5" step="0.01" value="0.15"><span class="val" id="v_speed_reduction_turn">0.15</span></div>
+  </div>
+
+  <div class="group">
+    <div class="group-label">Fail-safe</div>
+    <div class="row"><label>No-lane frames</label><input type="range" id="failsafe_no_lane_frames" min="1" max="60" value="10"><span class="val" id="v_failsafe_no_lane_frames">10</span></div>
+    <div class="row"><label>Max error px</label><input type="range" id="failsafe_max_error" min="50" max="640" value="300"><span class="val" id="v_failsafe_max_error">300</span></div>
+  </div>
+
+  <button class="btn stop" onclick="eStop()">⛔ Emergency Stop</button>
+  <div id="status"></div>
 </div>
+
+<!-- ── RIGHT: TELEMETRY PANEL ─────────────────────────── -->
+<div class="panel">
+  <h2>Live Telemetry</h2>
+  <div class="telem-grid">
+    <div class="card"><div class="lbl">Error (px)</div><div class="big" id="t_error">—</div></div>
+    <div class="card"><div class="lbl">Steering</div><div class="big" id="t_steer">—</div></div>
+    <div class="card"><div class="lbl">Speed</div><div class="big" id="t_speed">—</div></div>
+    <div class="card"><div class="lbl">Center X</div><div class="big" id="t_cx">—</div></div>
+    <div class="card"><div class="lbl">No-lane frames</div><div class="big" id="t_nolane">0</div></div>
+  </div>
+  <h2>Error history</h2>
+  <canvas id="chart"></canvas>
+</div>
+</div>
+
 <script>
-const sliders = ["speed","kp","ki","kd","h_lo","h_hi","s_lo","s_hi","v_lo","v_hi",
-                 "min_contour_area","lane_width","lane_adjuster","roi_side_limit"];
-sliders.forEach(id => {
-  const el = document.getElementById(id);
-  const disp = document.getElementById("v-"+id);
-  el.addEventListener("input", () => {
-    const v = parseFloat(el.value);
-    if (id === "speed") {
-      disp.textContent = (v/100).toFixed(2);
-      sendParam(id, v/100);
-    } else if (id === "roi_side_limit") {
-      disp.textContent = v.toFixed(2);
-      sendParam(id, v);
-    } else {
-      disp.textContent = Number.isInteger(v) ? v : v.toFixed(3);
-      sendParam(id, v);
-    }
+const PARAMS=[
+  'blur_ksize','canny_lo','canny_hi','binary_thresh',
+  'morph_ksize','morph_iterations',
+  'pid_kp','pid_ki','pid_kd',
+  'base_speed','speed_reduction_turn',
+  'failsafe_no_lane_frames','failsafe_max_error'
+];
+
+// ── sliders ───────────────────────────────────────────────────────────
+PARAMS.forEach(k=>{
+  const el=document.getElementById(k);
+  const vEl=document.getElementById('v_'+k);
+  if(!el)return;
+  el.addEventListener('input',()=>{
+    vEl.textContent=el.value;
+    fetch('/api/params',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({[k]:parseFloat(el.value)})})
+    .then(r=>r.json()).then(d=>setStatus(d.ok?'✓ '+k+'='+el.value:'✗ error'));
   });
 });
-function sendParam(key, value) {
-  fetch("/set", {method:"POST", headers:{"Content-Type":"application/json"},
-                 body: JSON.stringify({[key]: value})});
-}
-function setEnabled(v) {
-  fetch("/set", {method:"POST", headers:{"Content-Type":"application/json"},
-                 body: JSON.stringify({enabled: v})});
-}
-async function poll() {
-  try {
-    const r = await fetch("/status");
-    const d = await r.json();
-    document.getElementById("v-fps").textContent  = d.fps;
-    document.getElementById("v-err").textContent  = d.error.toFixed(2);
-    document.getElementById("v-str").textContent  = d.steer.toFixed(2);
 
-    const laneEl = document.getElementById("v-lane");
-    laneEl.textContent = d.lane_found ? "✓" : "✗";
-    laneEl.style.color = d.lane_found ? "#00d4aa" : "#ff4d4d";
-
-    const pct = (d.error + 1) / 2 * 100;
-    const bar = document.getElementById("error-bar");
-    bar.style.left = pct + "%";
-    bar.style.background = Math.abs(d.error) > 0.5 ? "#ff4d4d" : "#00d4aa";
-  } catch(e) {}
-  setTimeout(poll, 250);
+function setStatus(msg){
+  const s=document.getElementById('status');
+  s.textContent=msg;
+  setTimeout(()=>s.textContent='',2500);
 }
-poll();
+
+function eStop(){
+  fetch('/api/estop',{method:'POST'}).then(()=>setStatus('⛔ stop sent'));
+}
+
+// ── load current params from server ──────────────────────────────────
+fetch('/api/params').then(r=>r.json()).then(data=>{
+  PARAMS.forEach(k=>{
+    const el=document.getElementById(k);
+    const vEl=document.getElementById('v_'+k);
+    if(el&&data[k]!==undefined){el.value=data[k];if(vEl)vEl.textContent=data[k];}
+  });
+});
+
+// ── telemetry polling ─────────────────────────────────────────────────
+const errBuf=new Array(120).fill(null);
+const canvas=document.getElementById('chart');
+const ctx=canvas.getContext('2d');
+
+function drawChart(){
+  const W=canvas.clientWidth,H=80;
+  canvas.width=W;canvas.height=H;
+  ctx.fillStyle='#0d1018';ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='#1e2430';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(0,H/2);ctx.lineTo(W,H/2);ctx.stroke();
+  const valid=errBuf.filter(v=>v!==null);
+  if(!valid.length)return;
+  const mx=Math.max(...valid.map(Math.abs),1);
+  ctx.strokeStyle='#00e5ff';ctx.lineWidth=1.5;ctx.beginPath();
+  let started=false;
+  errBuf.forEach((v,i)=>{
+    if(v===null)return;
+    const x=(i/errBuf.length)*W;
+    const y=H/2-(v/mx)*(H/2-4);
+    if(!started){ctx.moveTo(x,y);started=true;}else ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+}
+
+function pollTelem(){
+  fetch('/api/telemetry').then(r=>r.json()).then(data=>{
+    if(!data.length)return;
+    const last=data[data.length-1];
+    const fmt=v=>v===null||v===undefined?'—':typeof v==='number'?v.toFixed(3):v;
+    document.getElementById('t_error').textContent=fmt(last.error);
+    document.getElementById('t_steer').textContent=fmt(last.steering);
+    document.getElementById('t_speed').textContent=fmt(last.speed);
+    document.getElementById('t_cx').textContent=fmt(last.center_x);
+    document.getElementById('t_nolane').textContent=last.no_lane??0;
+    // nolane color
+    const nl=document.getElementById('t_nolane');
+    nl.className='big'+(last.no_lane>3?' warn':'');
+    // chart
+    data.slice(-errBuf.length).forEach((d,i)=>{errBuf[i]=d.error;});
+    drawChart();
+  }).catch(()=>{});
+}
+setInterval(pollTelem,250);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
-@app.route("/")
-def index():
-    return render_template_string(DASHBOARD_HTML)
+def create_flask_app(pilot: LanePilot) -> Flask:
+    app = Flask(__name__)
+    log_ws = logging.getLogger("werkzeug")
+    log_ws.setLevel(logging.WARNING)   # silence Flask request logs
 
-def generate_mjpeg():
-    global stream_clients
-    with clients_lock:
-        stream_clients += 1
-    try:
-        while True:
-            with frame_lock:
-                frame = latest_frame
-            if frame is None:
-                time.sleep(0.02)
-                continue
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-            time.sleep(MJPEG_INTERVAL)
-    finally:
-        with clients_lock:
-            stream_clients -= 1
+    @app.route("/")
+    def index():
+        return render_template_string(DASHBOARD_HTML)
 
-@app.route("/video_feed")
-def video_feed():
-    return Response(generate_mjpeg(),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+    @app.route("/api/params", methods=["GET"])
+    def get_params():
+        with _param_lock:
+            return jsonify(dict(PARAMS))
 
-
-@app.route("/status")
-def status():
-    with state_lock:
-        return jsonify({k: state[k] for k in
-                        ("fps", "error", "steer", "lane_found", "enabled")})
-
-
-@app.route("/set", methods=["POST"])
-def set_param():
-    data = request.get_json(force=True)
-    with state_lock:
+    @app.route("/api/params", methods=["POST"])
+    def set_params():
+        data = request.get_json(force=True) or {}
+        changed = {}
+        errors  = {}
         for k, v in data.items():
-            if k in state:
-                state[k] = v
-                if k in ("kp", "ki", "kd"):
-                    pid_state["integral"]   = 0.0
-                    pid_state["last_error"] = 0.0
-    return jsonify({"ok": True})
+            if set_param(k, v):
+                changed[k] = v
+            else:
+                errors[k] = "unknown key"
+        return jsonify({"ok": not errors, "changed": changed, "errors": errors})
+
+    @app.route("/api/telemetry", methods=["GET"])
+    def telemetry():
+        return jsonify(pilot.get_telemetry())
+
+    @app.route("/api/estop", methods=["POST"])
+    def estop():
+        _emergency_stop()
+        pilot.stop()
+        return jsonify({"ok": True, "message": "emergency stop"})
+
+    return app
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 # ── Entry point ───────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    pilot = LanePilot()
+    app   = create_flask_app(pilot)
+
+    # Graceful shutdown
+    def _sig_handler(sig, frame):
+        log.info("Signal received – shutting down…")
+        pilot.stop()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT,  _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    # Flask in background daemon thread
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False),
+        daemon=True,
+        name="FlaskServer",
+    )
+    flask_thread.start()
+    log.info("Flask tuner running at http://0.0.0.0:5000")
+
+    # Main pipeline on calling thread (keeps GPU context on main thread)
+    pilot.run()
+
+
 if __name__ == "__main__":
-    car = JetRacer()
-    car.arm(delay=3)
-
-    t = threading.Thread(target=control_loop, args=(car,), daemon=True)
-    t.start()
-
-    print("[flask] Dashboard → http://0.0.0.0:5000")
-    # use_reloader=False is critical — reloader forks and doubles CPU load
-    app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
+    main()
