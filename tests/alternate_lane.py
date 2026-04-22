@@ -55,16 +55,10 @@ state = {
     "blur_ksize": 5,
     # Morphology
     "morph_ksize": 5,  "morph_iters": 2,
-    # Bird-eye ROI quad (fractions of frame w/h)
-    "bev_tl_x": 0.30, "bev_tl_y": 0.60,
-    "bev_tr_x": 0.70, "bev_tr_y": 0.60,
-    "bev_br_x": 0.95, "bev_br_y": 0.95,
-    "bev_bl_x": 0.05, "bev_bl_y": 0.95,
-    # Histogram / sliding window
-    "hist_row_frac": 0.5,
-    "sw_nwindows": 9,
-    "sw_margin": 60,
-    "sw_minpix": 25,
+    # ROI
+    "roi_top_frac": 0.5,
+    "roi_side_limit": 0.0,
+    "lane_offset": 140,
     # PID
     "kp": 0.55,  "ki": 0.003,  "kd": 0.25,
     # Drive
@@ -174,130 +168,6 @@ def to_gray(bgr):
     return cpu_grayscale(bgr)
 
 
-# ── Bird-eye perspective ──────────────────────────────────────────────────────
-_bev_M    = None
-_bev_Minv = None
-_bev_last = None
-
-def _build_bev(W, H, s):
-    """Rebuild perspective matrices when BEV params change."""
-    global _bev_M, _bev_Minv, _bev_last
-    key = (s["bev_tl_x"], s["bev_tl_y"], s["bev_tr_x"], s["bev_tr_y"],
-           s["bev_br_x"], s["bev_br_y"], s["bev_bl_x"], s["bev_bl_y"], W, H)
-    if key == _bev_last:
-        return
-    src = np.float32([
-        [s["bev_tl_x"] * W, s["bev_tl_y"] * H],
-        [s["bev_tr_x"] * W, s["bev_tr_y"] * H],
-        [s["bev_br_x"] * W, s["bev_br_y"] * H],
-        [s["bev_bl_x"] * W, s["bev_bl_y"] * H],
-    ])
-    dst = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
-    _bev_M    = cv2.getPerspectiveTransform(src, dst)
-    _bev_Minv = cv2.getPerspectiveTransform(dst, src)
-    _bev_last = key
-    print(f"[bev] Perspective matrix rebuilt for {W}×{H}")
-
-
-# ── Sliding-window lane detection ─────────────────────────────────────────────
-_left_base_prev  = None
-_right_base_prev = None
-
-def detect_lanes(bev_binary, s):
-    """
-    Histogram + sliding-window on a binary bird-eye image.
-    Returns (center_x, found, dbg_img).
-    """
-    global _left_base_prev, _right_base_prev
-
-    H, W = bev_binary.shape
-    row_start = int(s["hist_row_frac"] * H)
-    margin    = int(s["sw_margin"])
-    nwindows  = int(s["sw_nwindows"])
-    minpix    = int(s["sw_minpix"])
-
-    # ── Histogram on lower portion ────────────────────────────────────────
-    hist = np.sum(bev_binary[row_start:, :].astype(np.int32), axis=0)
-    midpoint = W // 2
-
-    left_base  = int(np.argmax(hist[:midpoint]))
-    right_base = int(np.argmax(hist[midpoint:]) + midpoint)
-
-    # IIR smooth with previous frame
-    alpha = 0.6
-    if _left_base_prev is not None:
-        left_base  = int(alpha * left_base  + (1 - alpha) * _left_base_prev)
-        right_base = int(alpha * right_base + (1 - alpha) * _right_base_prev)
-    _left_base_prev  = left_base
-    _right_base_prev = right_base
-
-    # ── Sliding windows ───────────────────────────────────────────────────
-    win_h = max(H // nwindows, 1)
-    nonzero  = bev_binary.nonzero()
-    nzy, nzx = np.array(nonzero[0]), np.array(nonzero[1])
-
-    left_cur, right_cur = left_base, right_base
-    left_idx_all, right_idx_all = [], []
-
-    dbg = cv2.cvtColor(bev_binary, cv2.COLOR_GRAY2BGR)
-
-    for w_i in range(nwindows):
-        y_lo = H - (w_i + 1) * win_h
-        y_hi = H - w_i * win_h
-        xl_lo, xl_hi = left_cur  - margin, left_cur  + margin
-        xr_lo, xr_hi = right_cur - margin, right_cur + margin
-
-        cv2.rectangle(dbg, (xl_lo, y_lo), (xl_hi, y_hi), (0, 255, 0), 1)
-        cv2.rectangle(dbg, (xr_lo, y_lo), (xr_hi, y_hi), (0, 0, 255), 1)
-
-        good_l = ((nzy >= y_lo) & (nzy < y_hi) &
-                  (nzx >= xl_lo) & (nzx < xl_hi)).nonzero()[0]
-        good_r = ((nzy >= y_lo) & (nzy < y_hi) &
-                  (nzx >= xr_lo) & (nzx < xr_hi)).nonzero()[0]
-
-        left_idx_all.append(good_l)
-        right_idx_all.append(good_r)
-
-        if len(good_l) > minpix:
-            left_cur = int(np.mean(nzx[good_l]))
-        if len(good_r) > minpix:
-            right_cur = int(np.mean(nzx[good_r]))
-
-    left_idx  = np.concatenate(left_idx_all)  if left_idx_all  else np.array([])
-    right_idx = np.concatenate(right_idx_all) if right_idx_all else np.array([])
-
-    if len(left_idx) < 5 or len(right_idx) < 5:
-        return None, False, dbg
-
-    # ── Polynomial fit (2nd order) ────────────────────────────────────────
-    ly, lx = nzy[left_idx],  nzx[left_idx]
-    ry, rx = nzy[right_idx], nzx[right_idx]
-
-    try:
-        left_fit  = np.polyfit(ly, lx, 2)
-        right_fit = np.polyfit(ry, rx, 2)
-    except np.linalg.LinAlgError:
-        return None, False, dbg
-
-    # ── Lane centre at bottom row ─────────────────────────────────────────
-    bot = H - 1
-    left_x  = np.polyval(left_fit,  bot)
-    right_x = np.polyval(right_fit, bot)
-    center_x = (left_x + right_x) / 2.0
-
-    # Draw fitted curves on debug image
-    ys = np.linspace(0, H - 1, H).astype(int)
-    lxs = np.clip(np.polyval(left_fit,  ys).astype(int), 0, W - 1)
-    rxs = np.clip(np.polyval(right_fit, ys).astype(int), 0, W - 1)
-    for y_val, lx_val, rx_val in zip(ys, lxs, rxs):
-        cv2.circle(dbg, (lx_val, y_val), 1, (255, 200, 0), -1)
-        cv2.circle(dbg, (rx_val, y_val), 1, (0, 200, 255), -1)
-
-    # Draw centre marker
-    cv2.circle(dbg, (int(center_x), bot), 6, (0, 255, 255), -1)
-
-    return center_x, True, dbg
-
 
 # ── Frame processing pipeline ────────────────────────────────────────────────
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -309,9 +179,15 @@ def process_frame(frame, s, annotate: bool):
     """
     global _last_steer
     h, w = frame.shape[:2]
+    roi_top = int(h * s.get("roi_top_frac", 0.5))
+    x_start = int(w * s.get("roi_side_limit", 0.0))
+    x_end   = w - x_start
+
+    # Crop early to save processing time
+    roi_bgr = frame[roi_top:h, x_start:x_end]
 
     # 1. Grayscale (GPU-accelerated if available)
-    gray = to_gray(frame)
+    gray = to_gray(roi_bgr)
 
     # 2. Gaussian blur
     bk = s["blur_ksize"] | 1   # ensure odd
@@ -331,18 +207,22 @@ def process_frame(frame, s, annotate: bool):
     mk = s["morph_ksize"] | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (mk, mk))
     cleaned = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=s["morph_iters"])
-    cleaned = cv2.morphologyEx(cleaned,  cv2.MORPH_OPEN,  kernel, iterations=1)
+    roi_mask = cv2.morphologyEx(cleaned,  cv2.MORPH_OPEN,  kernel, iterations=1)
 
-    # 6. Bird-eye warp
-    _build_bev(w, h, s)
-    bev = cv2.warpPerspective(cleaned, _bev_M, (w, h))
+    # 6. ROI and Contour Logic
+    ys, xs = np.where(roi_mask > 0)
 
-    # 7. Histogram + sliding-window lane detection
-    center_x, lane_found, bev_dbg = detect_lanes(bev, s)
+    lane_found = False
 
-    # 8. PID
-    if lane_found and center_x is not None:
-        error = (center_x - w / 2.0) / (w / 2.0)   # normalise to [-1, 1]
+    # 7. PID
+    if len(xs) > 50:
+        lane_found = True
+        left_x = np.min(xs) + x_start
+
+        # desired offset from left lane
+        target_x = left_x + s.get("lane_offset", 140)
+
+        error = (target_x - w / 2.0) / (w / 2.0)   # normalise to [-1, 1]
 
         now = time.time()
         dt  = max(now - pid_state["last_time"], 0.001)
@@ -366,42 +246,19 @@ def process_frame(frame, s, annotate: bool):
         # Build a side-by-side: original (left) + BEV debug (right)
         annotated = frame.copy()
 
-        # Draw BEV source quad on main image
-        pts = np.int32([
-            [s["bev_tl_x"] * w, s["bev_tl_y"] * h],
-            [s["bev_tr_x"] * w, s["bev_tr_y"] * h],
-            [s["bev_br_x"] * w, s["bev_br_y"] * h],
-            [s["bev_bl_x"] * w, s["bev_bl_y"] * h],
-        ])
-        cv2.polylines(annotated, [pts], True, (0, 255, 255), 1)
-
-        # Frame center line
-        cv2.line(annotated, (w // 2, 0), (w // 2, h), (0, 200, 255), 1)
-
-        # Steer arrow
-        arrow_x = int(w // 2 + steer * (w // 3))
-        cv2.arrowedLine(annotated, (w // 2, 22), (arrow_x, 22),
-                        (0, 140, 255), 2, tipLength=0.35)
-
-        # Status text
-        status = "DRIVING" if s["enabled"] else "STOPPED"
-        color  = (0, 220, 60) if s["enabled"] else (60, 60, 220)
-        cv2.putText(annotated, status, (5, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        cv2.putText(annotated, f"e{error:+.2f} s{steer:+.2f}", (5, 36),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.putText(annotated, f"fps {s['fps']}", (5, 52),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-
-        lane_col = (0, 220, 60) if lane_found else (0, 60, 220)
-        cv2.putText(annotated, "OK" if lane_found else "NO", (w - 30, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, lane_col, 1)
-
-        # Resize BEV debug to fit bottom-right corner
-        bev_small = cv2.resize(bev_dbg, (w // 3, h // 3))
-        y1 = h - bev_small.shape[0]
-        x1 = w - bev_small.shape[1]
-        annotated[y1:h, x1:w] = bev_small
+        # Draw ROI boundary
+        cv2.line(annotated, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
+        cv2.line(annotated, (x_start, roi_top), (x_start, h), (255, 0, 255), 1)
+        cv2.line(annotated, (x_end, roi_top), (x_end, h), (255, 0, 255), 1)
+        
+        # Mask overlay
+        mask_3ch = cv2.cvtColor(roi_mask, cv2.COLOR_GRAY2BGR)
+        mask_3ch[:, :, 0] = 0
+        annotated[roi_top:h, x_start:x_end] = cv2.addWeighted(
+            annotated[roi_top:h, x_start:x_end], 0.7, mask_3ch, 0.3, 0)
+        
+        if lane_found:
+            cv2.circle(annotated, (int(target_x), roi_top + 10), 8, (0, 255, 0), -1)
     else:
         annotated = frame
 
@@ -612,68 +469,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="val" id="v-morph_iters">2</span>
     </div>
     <hr class="divider">
-    <h2>Bird-eye ROI</h2>
+    <h2>Lane Tracking Parameters</h2>
     <div class="slider-row">
-      <label>TL x</label>
-      <input type="range" id="bev_tl_x" min="0" max="0.5" value="0.30" step="0.01">
-      <span class="val" id="v-bev_tl_x">0.30</span>
+      <label>Lane Offset</label>
+      <input type="range" id="lane_offset" min="50" max="250" value="140" step="1">
+      <span class="val" id="v-lane_offset">140</span>
     </div>
     <div class="slider-row">
-      <label>TL y</label>
-      <input type="range" id="bev_tl_y" min="0.3" max="0.9" value="0.60" step="0.01">
-      <span class="val" id="v-bev_tl_y">0.60</span>
+      <label>ROI Top Frac</label>
+      <input type="range" id="roi_top_frac" min="0.1" max="0.9" value="0.5" step="0.05">
+      <span class="val" id="v-roi_top_frac">0.5</span>
     </div>
     <div class="slider-row">
-      <label>TR x</label>
-      <input type="range" id="bev_tr_x" min="0.5" max="1" value="0.70" step="0.01">
-      <span class="val" id="v-bev_tr_x">0.70</span>
-    </div>
-    <div class="slider-row">
-      <label>TR y</label>
-      <input type="range" id="bev_tr_y" min="0.3" max="0.9" value="0.60" step="0.01">
-      <span class="val" id="v-bev_tr_y">0.60</span>
-    </div>
-    <div class="slider-row">
-      <label>BR x</label>
-      <input type="range" id="bev_br_x" min="0.5" max="1" value="0.95" step="0.01">
-      <span class="val" id="v-bev_br_x">0.95</span>
-    </div>
-    <div class="slider-row">
-      <label>BR y</label>
-      <input type="range" id="bev_br_y" min="0.5" max="1" value="0.95" step="0.01">
-      <span class="val" id="v-bev_br_y">0.95</span>
-    </div>
-    <div class="slider-row">
-      <label>BL x</label>
-      <input type="range" id="bev_bl_x" min="0" max="0.5" value="0.05" step="0.01">
-      <span class="val" id="v-bev_bl_x">0.05</span>
-    </div>
-    <div class="slider-row">
-      <label>BL y</label>
-      <input type="range" id="bev_bl_y" min="0.5" max="1" value="0.95" step="0.01">
-      <span class="val" id="v-bev_bl_y">0.95</span>
-    </div>
-    <hr class="divider">
-    <h2>Sliding window</h2>
-    <div class="slider-row">
-      <label>N windows</label>
-      <input type="range" id="sw_nwindows" min="3" max="20" value="9" step="1">
-      <span class="val" id="v-sw_nwindows">9</span>
-    </div>
-    <div class="slider-row">
-      <label>Margin</label>
-      <input type="range" id="sw_margin" min="10" max="150" value="60" step="5">
-      <span class="val" id="v-sw_margin">60</span>
-    </div>
-    <div class="slider-row">
-      <label>Min pix</label>
-      <input type="range" id="sw_minpix" min="5" max="100" value="25" step="5">
-      <span class="val" id="v-sw_minpix">25</span>
-    </div>
-    <div class="slider-row">
-      <label>Hist frac</label>
-      <input type="range" id="hist_row_frac" min="0.2" max="0.9" value="0.5" step="0.05">
-      <span class="val" id="v-hist_row_frac">0.5</span>
+      <label>ROI Side Limit</label>
+      <input type="range" id="roi_side_limit" min="0.0" max="0.45" value="0.0" step="0.01">
+      <span class="val" id="v-roi_side_limit">0.0</span>
     </div>
   </div>
 </div>
@@ -682,9 +492,7 @@ const sliders = [
   "speed","kp","ki","kd",
   "canny_lo","canny_hi","binary_thresh","blur_ksize",
   "morph_ksize","morph_iters",
-  "bev_tl_x","bev_tl_y","bev_tr_x","bev_tr_y",
-  "bev_br_x","bev_br_y","bev_bl_x","bev_bl_y",
-  "sw_nwindows","sw_margin","sw_minpix","hist_row_frac"
+  "lane_offset","roi_top_frac","roi_side_limit"
 ];
 sliders.forEach(id => {
   const el = document.getElementById(id);
