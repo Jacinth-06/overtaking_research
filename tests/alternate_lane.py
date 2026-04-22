@@ -28,9 +28,14 @@ import logging
 import sys
 import signal
 import math
+import os
 
 from flask import Flask, jsonify, request, render_template_string
 from collections import deque
+from jetracer import JetRacer
+
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
+os.environ["OPENCV_VIDEOIO_PRIORITY_FFMPEG"] = "0"
 
 # CuPy for CUDA-side ndarray ops (falls back to NumPy if unavailable)
 try:
@@ -267,30 +272,22 @@ class PIDController:
 # ─────────────────────────────────────────────────────────────────────────────
 # ── Motor interface (STUB – adapt to your hardware) ───────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
+car = None
+
 def _send_motor_command(speed: float, steering: float):
     """
     Send drive command to motor controller.
     speed    ∈ [0, 1]   (forward)
     steering ∈ [-1, 1]  (negative = left, positive = right)
-
-    Replace the body with your actual HAL:
-      - Adafruit MotorHAT
-      - RPi.GPIO PWM
-      - ROS publisher
-      - Serial to Arduino
-      - jetson-gpio PWM channels
     """
-    # Example: differential drive
-    left  = speed - steering * get("speed_reduction_turn")
-    right = speed + steering * get("speed_reduction_turn")
-    left  = max(0.0, min(1.0, left))
-    right = max(0.0, min(1.0, right))
-    # TODO: write left/right to your motor HAL here
-    # log.debug(f"Motor L={left:.3f} R={right:.3f}")
+    if car is not None:
+        car.steer(steering)
+        car.forward(speed)
 
 
 def _emergency_stop():
-    _send_motor_command(0.0, 0.0)
+    if car is not None:
+        car.stop()
     log.warning("⛔ Emergency stop triggered.")
 
 
@@ -556,10 +553,31 @@ class LanePilot:
 
     # ── Run loop ──────────────────────────────────────────────────────────────
     def run(self):
-        cap = cv2.VideoCapture(get("camera_index"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  get("frame_width"))
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, get("frame_height"))
-        cap.set(cv2.CAP_PROP_FPS,          get("fps_cap"))
+        w = get("frame_width")
+        h = get("frame_height")
+        fps = get("fps_cap")
+        
+        gst = (
+            f"nvarguscamerasrc sensor-id={get('camera_index')} ! "
+            f"video/x-raw(memory:NVMM), "
+            f"width=(int)1280, height=(int)720, "
+            f"framerate=(fraction)60/1, format=(string)NV12 ! "
+            f"nvvidconv flip-method=0 ! "
+            f"video/x-raw, width=(int){w}, height=(int){h}, "
+            f"format=(string)BGRx ! "
+            f"videoconvert ! "
+            f"video/x-raw, format=(string)BGR ! "
+            f"appsink drop=1 max-buffers=1"
+        )
+        log.info(f"Trying GStreamer pipeline:\n  {gst}")
+        cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+        
+        if not cap.isOpened():
+            log.warning("GStreamer pipeline failed, trying USB fallback...")
+            cap = cv2.VideoCapture(get("camera_index"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+            cap.set(cv2.CAP_PROP_FPS,          fps)
 
         if not cap.isOpened():
             log.error("Cannot open camera.")
@@ -857,6 +875,10 @@ def create_flask_app(pilot: LanePilot) -> Flask:
 # ── Entry point ───────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    global car
+    car = JetRacer()
+    car.arm(delay=3)
+
     pilot = LanePilot()
     app   = create_flask_app(pilot)
 
