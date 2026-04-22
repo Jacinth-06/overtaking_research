@@ -324,7 +324,8 @@ def process_frame(frame, s, annotate: bool):
     _, binary = cv2.threshold(blurred, s["binary_thresh"], 255, cv2.THRESH_BINARY)
 
     # 4. OR combine
-    combined = cv2.bitwise_or(edges, binary)
+    combined = cv2.bitwise_and(edges, binary)
+    combined = cv2.dilate(combined, np.ones((3,3), np.uint8), iterations=1)
 
     # 5. Morphology clean
     mk = s["morph_ksize"] | 1
