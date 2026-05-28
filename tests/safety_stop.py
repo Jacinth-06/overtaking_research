@@ -1,4 +1,4 @@
-from jetracer.jetracer import JetRacer
+from jetracer import JetRacer
 import time
 
 # Initialize car and Lidar
