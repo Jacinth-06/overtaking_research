@@ -4,12 +4,12 @@ from geometry_msgs.msg import Twist
 
 # This imports from your existing jetracer library 
 # (We will make sure Python can see it via a symlink)
-from jetracer.nvidia_racecar import NvidiaRacecar
+from jetracer import JetRacer
 
 class JetRacerHardwareNode(Node):
     def __init__(self):
         super().__init__('jetracer_hardware_node')
-        self.car = NvidiaRacecar()
+        self.car = JetRacer()
         self.subscription = self.create_subscription(
             Twist,
             '/cmd_vel',
