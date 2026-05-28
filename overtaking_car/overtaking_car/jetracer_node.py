@@ -2,9 +2,10 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
+
 # This imports from your existing jetracer library 
 # (We will make sure Python can see it via a symlink)
-from jetracer import JetRacer
+from overtaking_car.jetracer import JetRacer
 
 class JetRacerHardwareNode(Node):
     def __init__(self):
