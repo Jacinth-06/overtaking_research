@@ -1,1 +1,1 @@
-from jetracer.jetracer import JetRacer
+from .jetracer import JetRacer
