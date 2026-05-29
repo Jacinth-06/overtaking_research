@@ -291,31 +291,57 @@ _lidar_cache_lock = threading.Lock()
 def lidar_loop(car: JetRacer):
     """
     Background thread: poll lidar at ~10 Hz and cache the result.
-    Uses fewer samples (60 vs 120) since we only need the front cone.
+    Uses fewer samples (120) for faster reaction and monitors the front cone.
     """
     print("[lidar] Background safety thread started")
     while True:
         try:
-            scan = car.lidar_scan(samples=60)
+            # 1. Get a quick scan (matching your working script's 120 samples)
+            scan = car.lidar_scan(samples=120)
+            
+            # 2. Extract the minimum distance in the front 40-degree cone
             front = [d for a, d in scan.items() if a >= 320 or a <= 40]
+            
             if front:
                 closest = min(front)
+                
+                # Fetch threshold dynamically from global state
                 with state_lock:
                     stop_dist = state["stop_distance"]
-                blocked = closest < stop_dist
+                
+                # 3. Decision & Recovery Logic
+                if closest < stop_dist:
+                    blocked = True
+                    print(f"\n[!] EMERGENCY STOP: Object at {closest:.1f}mm")
+                    
+                    # Lock the thread in a tight check loop until path clears
+                    while closest < stop_dist:
+                        time.sleep(0.5)
+                        try:
+                            new_scan = car.lidar_scan(samples=120)
+                            new_front = [d for a, d in new_scan.items() if a >= 320 or a <= 40]
+                            closest = min(new_front) if new_front else 0.0
+                        except Exception:
+                            closest = 0.0  # Treat tracking loss as blocked
+                    
+                    print("\n[+] Path clear. Resuming...")
+                    blocked = False
+                else:
+                    blocked = False
             else:
                 # No readings in front cone — treat as blocked for safety
                 closest, blocked = 0.0, True
+                
         except Exception as e:
             print(f"[lidar] scan error: {e}")
             closest, blocked = 0.0, True
 
+        # Write updates to the global background cache for the control loop
         with _lidar_cache_lock:
             _lidar_cache["closest"] = round(closest, 1)
             _lidar_cache["blocked"] = blocked
 
         time.sleep(0.10)   # 10 Hz — fast enough for obstacle reaction
-
 
 # ── Control loop ──────────────────────────────────────────────────────────────
 def control_loop(car: JetRacer):
