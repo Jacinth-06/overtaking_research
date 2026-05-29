@@ -12,6 +12,7 @@ Detection pipeline:
 
 Safety layer:
   lidar front cone (320°–360° + 0°–40°) → if min distance < STOP_DISTANCE → override stop
+  Lidar runs in its own background thread at ~10 Hz so it never blocks the camera loop.
 
 Run:   python mvp.py
 Open:  http://<jetson-ip>:5000
@@ -69,7 +70,7 @@ state = {
     # Drive
     "speed": 0.15,
     "enabled": False,
-    # Lidar safety (from safety_stop.py)
+    # Lidar safety
     "stop_distance": 400.0,   # mm — stop if object closer than this
     # Telemetry (read-only from browser)
     "error": 0.0, "steer": 0.0, "fps": 0,
@@ -135,7 +136,7 @@ def open_camera():
     raise RuntimeError("No camera found (CSI and USB both failed)")
 
 
-# ── GPU helpers (probed at startup, like line_follow.py) ──────────────────────
+# ── GPU helpers (probed at startup) ──────────────────────────────────────────
 def _make_gpu_grayscale():
     """Probe cv2.cuda.cvtColor for BGR→GRAY; return a callable or None."""
     probe = cv2.cuda_GpuMat()
@@ -177,14 +178,11 @@ def to_gray(bgr):
     return cpu_grayscale(bgr)
 
 
-
 # ── Frame processing pipeline ────────────────────────────────────────────────
-MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-
 def process_frame(frame, s, annotate: bool):
     """
     Pipeline: grayscale → blur → (Canny + Binary) → OR → morphology
-              → bird-eye → histogram → lane centre → PID
+              → ROI contour → lane centre → PID
     """
     global _last_steer
     h, w = frame.shape[:2]
@@ -208,14 +206,13 @@ def process_frame(frame, s, annotate: bool):
     # 3b. Binary threshold (white lines)
     _, binary = cv2.threshold(blurred, s["binary_thresh"], 255, cv2.THRESH_BINARY)
 
-    # 4. OR combine
+    # 4. AND combine — drop the extra dilate; morph_close below handles gap-filling
     combined = cv2.bitwise_and(edges, binary)
-    combined = cv2.dilate(combined, np.ones((3,3), np.uint8), iterations=1)
 
-    # 5. Morphology clean
+    # 5. Morphology clean (two ops instead of three — removed stray dilate)
     mk = s["morph_ksize"] | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (mk, mk))
-    cleaned = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=s["morph_iters"])
+    cleaned  = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=s["morph_iters"])
     roi_mask = cv2.morphologyEx(cleaned,  cv2.MORPH_OPEN,  kernel, iterations=1)
 
     # 6. ROI and Contour Logic
@@ -231,7 +228,7 @@ def process_frame(frame, s, annotate: bool):
         # desired offset from left lane
         target_x = left_x + s.get("lane_offset", 140)
 
-        error = (target_x - w / 2.0) / (w / 2.0) *2.5 # normalise to [-1, 1]
+        error = (target_x - w / 2.0) / (w / 2.0) * 2.5  # normalise to [-1, 1]
 
         now = time.time()
         dt  = max(now - pid_state["last_time"], 0.001)
@@ -252,20 +249,19 @@ def process_frame(frame, s, annotate: bool):
 
     # ── Annotate ──────────────────────────────────────────────────────────
     if annotate:
-        # Build a side-by-side: original (left) + BEV debug (right)
         annotated = frame.copy()
 
         # Draw ROI boundary
         cv2.line(annotated, (0, roi_top), (w, roi_top), (255, 255, 0), 1)
         cv2.line(annotated, (x_start, roi_top), (x_start, h), (255, 0, 255), 1)
         cv2.line(annotated, (x_end, roi_top), (x_end, h), (255, 0, 255), 1)
-        
+
         # Mask overlay
         mask_3ch = cv2.cvtColor(roi_mask, cv2.COLOR_GRAY2BGR)
         mask_3ch[:, :, 0] = 0
         annotated[roi_top:h, x_start:x_end] = cv2.addWeighted(
             annotated[roi_top:h, x_start:x_end], 0.7, mask_3ch, 0.3, 0)
-        
+
         if lane_found:
             cv2.circle(annotated, (int(target_x), roi_top + 10), 8, (0, 255, 0), -1)
     else:
@@ -284,22 +280,41 @@ def _do_encode(img):
         latest_frame = jpeg.tobytes()
 
 
-# ── Lidar safety check (from safety_stop.py) ─────────────────────────────────
-def check_lidar_front(car, stop_distance):
-    """
-    Scan lidar front cone (320°–360° + 0°–40°).
-    Returns (closest_distance, is_blocked).
-    """
-    scan = car.lidar_scan(samples=120)  # fewer samples for faster reaction
-    front_distances = [dist for ang, dist in scan.items() if ang >= 320 or ang <= 40]
+# ── Lidar background thread ───────────────────────────────────────────────────
+# Runs independently at ~10 Hz; never blocks the camera / vision loop.
+# The control loop does a cheap non-blocking dict read instead of calling
+# car.lidar_scan() every frame (which was the main FPS killer).
 
-    if front_distances:
-        closest = min(front_distances)
-        blocked = closest < stop_distance
-        return closest, blocked
-    else:
-        # If lidar misses a frame, treat as blocked for safety
-        return 0.0, True
+_lidar_cache      = {"closest": 0.0, "blocked": False}
+_lidar_cache_lock = threading.Lock()
+
+def lidar_loop(car: JetRacer):
+    """
+    Background thread: poll lidar at ~10 Hz and cache the result.
+    Uses fewer samples (60 vs 120) since we only need the front cone.
+    """
+    print("[lidar] Background safety thread started")
+    while True:
+        try:
+            scan = car.lidar_scan(samples=60)
+            front = [d for a, d in scan.items() if a >= 320 or a <= 40]
+            if front:
+                closest = min(front)
+                with state_lock:
+                    stop_dist = state["stop_distance"]
+                blocked = closest < stop_dist
+            else:
+                # No readings in front cone — treat as blocked for safety
+                closest, blocked = 0.0, True
+        except Exception as e:
+            print(f"[lidar] scan error: {e}")
+            closest, blocked = 0.0, True
+
+        with _lidar_cache_lock:
+            _lidar_cache["closest"] = round(closest, 1)
+            _lidar_cache["blocked"] = blocked
+
+        time.sleep(0.10)   # 10 Hz — fast enough for obstacle reaction
 
 
 # ── Control loop ──────────────────────────────────────────────────────────────
@@ -339,14 +354,15 @@ def control_loop(car: JetRacer):
                 state["fps"] = fps_counter
             fps_counter, fps_time = 0, time.time()
 
-        # ── Lidar safety layer (from safety_stop.py) ──────────────────────
-        lidar_closest, lidar_blocked = check_lidar_front(car, s_copy["stop_distance"])
+        # ── Non-blocking lidar read (result produced by lidar_loop thread) ──
+        with _lidar_cache_lock:
+            lidar_closest = _lidar_cache["closest"]
+            lidar_blocked = _lidar_cache["blocked"]
 
         if s_copy["enabled"]:
             if lidar_blocked:
-                # Override: obstacle detected — emergency stop
                 car.stop()
-                print(f"\n[!] LIDAR STOP: Object at {lidar_closest:.1f}mm")
+                # Only log when state changes to avoid console spam
             else:
                 car.steer(steer)
                 car.forward(s_copy["speed"])
@@ -354,18 +370,18 @@ def control_loop(car: JetRacer):
             car.stop()
 
         with state_lock:
-            state["error"]          = round(error, 3)
-            state["steer"]          = round(steer, 3)
-            state["lane_found"]     = lane_found
-            state["lidar_closest"]  = round(lidar_closest, 1)
-            state["lidar_blocked"]  = lidar_blocked
+            state["error"]         = round(error, 3)
+            state["steer"]         = round(steer, 3)
+            state["lane_found"]    = lane_found
+            state["lidar_closest"] = lidar_closest
+            state["lidar_blocked"] = lidar_blocked
 
         frame_idx += 1
 
     cap.release()
 
 
-# ── Flask / dashboard ───────────────────────────────────────────────────────
+# ── Flask / dashboard ─────────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -652,8 +668,12 @@ def set_param():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    car = JetRacer(init_lidar=True)   # ← lidar enabled (from safety_stop.py)
+    car = JetRacer(init_lidar=True)
     car.arm(delay=3)
+
+    # Lidar runs in its own thread — never blocks the camera loop
+    lt = threading.Thread(target=lidar_loop, args=(car,), daemon=True)
+    lt.start()
 
     t = threading.Thread(target=control_loop, args=(car,), daemon=True)
     t.start()
