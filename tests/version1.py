@@ -223,8 +223,36 @@ def process_frame(frame, s, annotate: bool):
     if len(xs) > 50:
         lane_found = True
         
-        # actual lane following: target is the average x position
-        target_x = np.mean(xs) + x_start
+        # Calculate the geometric middle of your cropped ROI
+        roi_width = x_end - x_start
+        mid_point = roi_width / 2.0
+        
+        # Split detected pixels into left-of-center and right-of-center
+        left_pixels = xs[xs < mid_point]
+        right_pixels = xs[xs >= mid_point]
+        
+        if len(left_pixels) > 10 and len(right_pixels) > 10:
+            # BOTH LANES DETECTED
+            # Find the center of the left line and center of the right line individually
+            left_x = np.mean(left_pixels) + x_start
+            right_x = np.mean(right_pixels) + x_start
+            
+            # The true centroid is exactly between the two lines
+            target_x = (left_x + right_x) / 2.0
+            
+        elif len(left_pixels) > 10:
+            # ONLY LEFT LANE DETECTED (e.g., sharp left turn)
+            left_x = np.mean(left_pixels) + x_start
+            target_x = left_x + 140  # Hardcoded fallback offset
+            
+        elif len(right_pixels) > 10:
+            # ONLY RIGHT LANE DETECTED (e.g., sharp right turn)
+            right_x = np.mean(right_pixels) + x_start
+            target_x = right_x - 140 # Hardcoded fallback offset
+            
+        else:
+            # Failsafe
+            target_x = w / 2.0
 
         error = (target_x - w / 2.0) / (w / 2.0) * 3.5  # normalise to [-1, 1]
 
