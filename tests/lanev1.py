@@ -192,32 +192,32 @@ def gpu_blur(gray_cpu, ksize):
 # ── Lane detection (centre of left+right edges) ───────────────────────────────
 def find_lane_centre(binary_roi):
     """
-    Given a binary ROI (white pixels = lane markings):
-      - split frame into left half and right half
-      - find the x-centroid of white pixels in each half
-      - lane centre = average of left_x and right_x
-    Returns: (centre_x or None, left_x, right_x)
-             centre_x is None when fewer than one lane edge is found.
+    Split ROI into left/right halves, find x-centroid of white pixels
+    in each half independently, return their average as lane centre.
+    Uses np.where directly (not np.column_stack) so empty results are safe.
+    Returns: (centre_x or None, left_x or None, right_x or None)
     """
     h, w = binary_roi.shape
+
     left_half  = binary_roi[:, :w // 2]
     right_half = binary_roi[:, w // 2:]
 
-    left_pts  = np.column_stack(np.where(left_half  > 0))  # rows, cols
-    right_pts = np.column_stack(np.where(right_half > 0))
+    # np.where returns tuple of arrays; safe even when empty
+    _, left_cols  = np.where(left_half  > 0)
+    _, right_cols = np.where(right_half > 0)
 
-    has_left  = len(left_pts)  > 30
-    has_right = len(right_pts) > 30
+    has_left  = len(left_cols)  > 30
+    has_right = len(right_cols) > 30
 
-    left_x  = float(np.mean(left_pts[:,  1]))           if has_left  else None
-    right_x = float(np.mean(right_pts[:, 1])) + w // 2  if has_right else None
+    left_x  = float(np.mean(left_cols))             if has_left  else None
+    right_x = float(np.mean(right_cols)) + (w // 2) if has_right else None
 
     if has_left and has_right:
         centre_x = (left_x + right_x) / 2.0
     elif has_left:
-        centre_x = left_x + w * 0.25   # guess centre from left edge
+        centre_x = left_x + w * 0.25
     elif has_right:
-        centre_x = right_x - w * 0.25  # guess centre from right edge
+        centre_x = right_x - w * 0.25
     else:
         centre_x = None
 
@@ -239,6 +239,11 @@ def process_frame(frame, s, annotate):
 
     # 2. Gaussian blur  (GPU if available)
     blurred = gpu_blur(gray, s["blur_ksize"])
+    # Ensure contiguous C-array after GPU download (required by Canny/morphologyEx)
+    if not blurred.flags["C_CONTIGUOUS"]:
+        blurred = np.ascontiguousarray(blurred)
+    if blurred.size == 0:
+        return frame, 0.0, _last_steer, False
 
     # 3a. Canny edges
     edges = cv2.Canny(blurred, s["canny_lo"], s["canny_hi"])
@@ -347,7 +352,12 @@ def control_loop(car: JetRacer):
         with clients_lock:
             do_annotate = (stream_clients > 0) and (frame_idx % ENCODE_EVERY == 0)
 
-        annotated, error, steer, lane_found = process_frame(frame, s, do_annotate)
+        try:
+            annotated, error, steer, lane_found = process_frame(frame, s, do_annotate)
+        except Exception as e:
+            print("[loop] process_frame error (skipping frame):", e)
+            frame_idx += 1
+            continue
 
         if do_annotate:
             _encode_pool.submit(_do_encode, annotated)
