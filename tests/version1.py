@@ -298,56 +298,54 @@ def lidar_loop(car: JetRacer):
     print("[lidar] Background safety thread started")
     while True:
         try:
-            # 1. Get a quick scan (120 samples — matches standalone script)
-            scan = car.lidar_scan(samples=120)
+            # Fetch threshold dynamically from global state to keep dashboard working
+            with state_lock:
+                STOP_DISTANCE = state["stop_distance"]
 
-            # 2. Extract minimum distance in front 40-degree cone
-            #    Angles: 320–359 and 0–40
-            front_distances = [dist for ang, dist in scan.items()
-                                if ang >= 320 or ang <= 40]
-
+            # 1. Get a quick scan
+            scan = car.lidar_scan(samples=120) # Using fewer samples for faster reaction
+            
+            # 2. Extract the minimum distance in the front 40-degree cone
+            # Angles: 320-359 and 0-40
+            front_distances = [dist for ang, dist in scan.items() if ang >= 320 or ang <= 40]
+            
             if front_distances:
                 closest_front = min(front_distances)
-
-                # Fetch threshold dynamically from global state
-                with state_lock:
-                    stop_dist = state["stop_distance"]
-
+                print(f"Distance Ahead: {closest_front:.1f}mm", end='\r')
+                
                 # 3. Decision Logic
-                if closest_front < stop_dist:
+                if closest_front < STOP_DISTANCE:
+                    car.stop()
                     blocked = True
                     print(f"\n[!] EMERGENCY STOP: Object at {closest_front:.1f}mm")
-
-                    # Tight recovery loop — mirrors standalone script exactly
-                    while closest_front < stop_dist:
+                    # Wait until path is clear or script is exited
+                    while closest_front < STOP_DISTANCE:
                         time.sleep(0.5)
-                        try:
-                            new_scan = car.lidar_scan(samples=100)
-                            new_front = [d for a, d in new_scan.items()
-                                         if a >= 340 or a <= 20]
-                            closest_front = min(new_front) if new_front else 0
-                        except Exception:
-                            closest_front = 0  # treat scan loss as blocked
-
+                        # Re-check
+                        new_scan = car.lidar_scan(samples=100)
+                        new_front = [d for a, d in new_scan.items() if a >= 340 or a <= 20]
+                        closest_front = min(new_front) if new_front else 0
                     print("\n[+] Path clear. Resuming...")
                     blocked = False
                 else:
                     blocked = False
-
+                    # Note: We omit car.forward(DRIVE_SPEED) here because the camera 
+                    # control_loop is driving and steering the car. 
             else:
-                # If Lidar misses a frame, stop for safety — matches standalone
+                # If Lidar misses a frame, stop for safety
+                car.stop()
                 closest_front = 0.0
                 blocked = True
+
+            # Write updates to the global background cache for the control loop
+            with _lidar_cache_lock:
+                _lidar_cache["closest"] = round(closest_front, 1)
+                _lidar_cache["blocked"] = blocked
 
         except Exception as e:
             print(f"[lidar] scan error: {e}")
             closest_front = 0.0
             blocked = True
-
-        # Write updates to the global background cache for the control loop
-        with _lidar_cache_lock:
-            _lidar_cache["closest"] = round(closest_front, 1)
-            _lidar_cache["blocked"] = blocked
 
         time.sleep(0.10)   # ~10 Hz — fast enough for obstacle reaction
 
