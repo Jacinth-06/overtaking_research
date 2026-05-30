@@ -316,8 +316,14 @@ def lidar_loop(car: JetRacer):
                 # 3. Decision Logic
                 if closest_front < STOP_DISTANCE:
                     car.stop()
-                    blocked = True
                     print(f"\n[!] EMERGENCY STOP: Object at {closest_front:.1f}mm")
+
+                    # Update cache IMMEDIATELY so control_loop sees blocked=True
+                    # and doesn't override our car.stop() with car.forward()
+                    with _lidar_cache_lock:
+                        _lidar_cache["closest"] = round(closest_front, 1)
+                        _lidar_cache["blocked"] = True
+
                     # Wait until path is clear or script is exited
                     while closest_front < STOP_DISTANCE:
                         time.sleep(0.5)
@@ -325,27 +331,32 @@ def lidar_loop(car: JetRacer):
                         new_scan = car.lidar_scan(samples=100)
                         new_front = [d for a, d in new_scan.items() if a >= 340 or a <= 20]
                         closest_front = min(new_front) if new_front else 0
+
+                        # Keep cache updated during recovery so dashboard shows live distance
+                        with _lidar_cache_lock:
+                            _lidar_cache["closest"] = round(closest_front, 1)
+                            _lidar_cache["blocked"] = True
+
                     print("\n[+] Path clear. Resuming...")
-                    blocked = False
+                    with _lidar_cache_lock:
+                        _lidar_cache["closest"] = round(closest_front, 1)
+                        _lidar_cache["blocked"] = False
                 else:
-                    blocked = False
-                    # Note: We omit car.forward(DRIVE_SPEED) here because the camera 
-                    # control_loop is driving and steering the car. 
+                    with _lidar_cache_lock:
+                        _lidar_cache["closest"] = round(closest_front, 1)
+                        _lidar_cache["blocked"] = False
             else:
                 # If Lidar misses a frame, stop for safety
                 car.stop()
-                closest_front = 0.0
-                blocked = True
-
-            # Write updates to the global background cache for the control loop
-            with _lidar_cache_lock:
-                _lidar_cache["closest"] = round(closest_front, 1)
-                _lidar_cache["blocked"] = blocked
+                with _lidar_cache_lock:
+                    _lidar_cache["closest"] = 0.0
+                    _lidar_cache["blocked"] = True
 
         except Exception as e:
             print(f"[lidar] scan error: {e}")
-            closest_front = 0.0
-            blocked = True
+            with _lidar_cache_lock:
+                _lidar_cache["closest"] = 0.0
+                _lidar_cache["blocked"] = True
 
         time.sleep(0.10)   # ~10 Hz — fast enough for obstacle reaction
 
