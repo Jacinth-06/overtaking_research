@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 lane_follow.py — GPU-accelerated centre-lane follower + Flask dashboard
 Target: Jetson Nano 4 GB  |  Straight-line road  |  Single left + right lane
