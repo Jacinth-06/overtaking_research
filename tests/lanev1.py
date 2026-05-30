@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
 """
 lane_follow.py — GPU-accelerated centre-lane follower + Flask dashboard
 Target: Jetson Nano 4 GB  |  Straight-line road  |  Single left + right lane
@@ -156,7 +155,7 @@ def _probe_gpu_grayscale():
 gpu_grayscale = _probe_gpu_grayscale() if USE_CUDA else None
 
 
-def _make_cuda_gaussian(ksize: int):
+def _make_cuda_gaussian(ksize):
     """Create (or recreate) a persistent CUDA Gaussian filter."""
     global _cuda_gaussian
     try:
@@ -174,7 +173,7 @@ if USE_CUDA:
 _last_blur_ksize = state["blur_ksize"] | 1
 
 
-def gpu_blur(gray_cpu: np.ndarray, ksize: int) -> np.ndarray:
+def gpu_blur(gray_cpu, ksize):
     """
     GPU Gaussian blur.  Recreates the filter only when ksize changes.
     Falls back to CPU if CUDA filter unavailable.
@@ -191,7 +190,7 @@ def gpu_blur(gray_cpu: np.ndarray, ksize: int) -> np.ndarray:
 
 
 # ── Lane detection (centre of left+right edges) ───────────────────────────────
-def find_lane_centre(binary_roi: np.ndarray) -> tuple[float | None, float, float]:
+def find_lane_centre(binary_roi):
     """
     Given a binary ROI (white pixels = lane markings):
       - split frame into left half and right half
@@ -226,7 +225,7 @@ def find_lane_centre(binary_roi: np.ndarray) -> tuple[float | None, float, float
 
 
 # ── Full processing pipeline ───────────────────────────────────────────────────
-def process_frame(frame: np.ndarray, s: dict, annotate: bool):
+def process_frame(frame, s, annotate):
     global _last_steer
     h, w = frame.shape[:2]
     roi_top = int(h * s["roi_top_frac"])
@@ -315,7 +314,7 @@ def process_frame(frame: np.ndarray, s: dict, annotate: bool):
 
 
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
-def _do_encode(img: np.ndarray):
+def _do_encode(img):
     ret, jpeg = cv2.imencode(".jpg", img,
                               [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
     if not ret:
