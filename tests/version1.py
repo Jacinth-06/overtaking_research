@@ -222,6 +222,7 @@ def process_frame(frame, s, annotate: bool):
     lane_found = False
     left_found = False
     right_found = False
+    lane_width = 0.0
 
     # 7. PID
     if len(xs) > 50:
