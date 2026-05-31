@@ -429,16 +429,25 @@ def control_loop(car: JetRacer):
             elif autonomy_state == "OVERTAKING":
                 car.steer(0.5)
                 car.forward(s_copy["speed"])
-                # Wait for original lane to be lost, then wait for new lane to be found
+                
                 phase = pid_state.get("crossing_phase", 1)
+                
+                # PHASE 1: Wait for original left lane to disappear off the left side of the screen
                 if phase == 1:
                     if not left_found:
                         pid_state["crossing_phase"] = 2
-                        print("\n[STATE CHANGE] OVERTAKING -> Phase 2 (lost old lane)", flush=True)
+                        print("\n[STATE CHANGE] OVERTAKING Phase 1 -> 2 (Lost old left lane)", flush=True)
+                        
+                # PHASE 2: Wait for original right lane to cross the center of the camera to become the NEW left lane
                 elif phase == 2:
+                    if left_found:
+                        pid_state["crossing_phase"] = 3
+                        print("\n[STATE CHANGE] OVERTAKING Phase 2 -> 3 (Old right lane became new left lane)", flush=True)
+                        
+                # PHASE 3: Wait for a brand new right lane to appear on the right side of the screen
+                elif phase == 3:
                     target_lw = pid_state.get("nominal_lane_width", 200.0)
-                    # Check if both lanes are visible and lane width is within 40% margin
-                    if left_found and right_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
+                    if right_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
                         autonomy_state = "CHECKING"
                         pid_state["crossing_phase"] = 1
                         print(f"\n[STATE CHANGE] -> CHECKING. Switched to right lane. Width: {lane_width:.1f}", flush=True)
@@ -465,15 +474,27 @@ def control_loop(car: JetRacer):
             elif autonomy_state == "RECOVERY":
                 car.steer(-0.5)
                 car.forward(s_copy["speed"])
+                
                 phase = pid_state.get("crossing_phase", 1)
+                
+                # PHASE 1: Wait for original right lane to disappear off the right side of the screen
                 if phase == 1:
                     if not right_found:
                         pid_state["crossing_phase"] = 2
-                        print("\n[STATE CHANGE] RECOVERY -> Phase 2 (lost old right lane)", flush=True)
+                        print("\n[STATE CHANGE] RECOVERY Phase 1 -> 2 (Lost old right lane)", flush=True)
+                        
+                # PHASE 2: Wait for original left lane to cross the center to become the NEW right lane
                 elif phase == 2:
+                    if right_found:
+                        pid_state["crossing_phase"] = 3
+                        print("\n[STATE CHANGE] RECOVERY Phase 2 -> 3 (Old left lane became new right lane)", flush=True)
+                        
+                # PHASE 3: Wait for a brand new left lane to appear on the left side of the screen
+                elif phase == 3:
                     target_lw = pid_state.get("nominal_lane_width", 200.0)
-                    if left_found and right_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
+                    if left_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
                         autonomy_state = "FOLLOW"
+                        pid_state["crossing_phase"] = 1
                         print(f"\n[STATE CHANGE] -> FOLLOW. Back in original lane. Width: {lane_width:.1f}", flush=True)
                         pid_state["integral"] = 0.0
                         pid_state["last_error"] = 0.0
