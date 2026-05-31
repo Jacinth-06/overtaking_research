@@ -402,51 +402,43 @@ def control_loop(car: JetRacer):
         if s_copy["enabled"]:
             if autonomy_state == "FOLLOW":
                 if lidar_blocked:
-                    autonomy_state = "OVERTAKING"
+                    autonomy_state = "SWERVE_OUT"
                     pid_state["state_start_time"] = time.time()
-                    car.steer(0.5)
-                    car.forward(s_copy["speed"])
                 else:
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                     
-            elif autonomy_state == "OVERTAKING":
-                car.steer(0.5)
+            elif autonomy_state == "SWERVE_OUT":
+                # 1. Turn HARD RIGHT to escape the obstacle
+                car.steer(1.0) # Full right steering lock!
                 car.forward(s_copy["speed"])
-                # Wait for 1.5 seconds min to allow crossing, then transition when lane is found again
+                
                 elapsed = time.time() - pid_state["state_start_time"]
-                if elapsed > 1.5 and lane_found:
-                    autonomy_state = "FOLLOW_RIGHT"
+                if elaps: # Adjust this time based on how wide your lane is
+                    autonomy_state = "STRAIGHTEN_UP"
                     pid_state["state_start_time"] = time.time()
+                    
+            elif autonomy_state == "STRAIGHTEN_UP":
+                # 2. Turn HARD LEFT to counter-steer and straighten out
+                car.steer(-1.0) # Full left steering lock!
+                car.forward(s_copy["speed"])
+                
+                elapsed = time.time() - pid_state["state_start_time"]
+                if elapsed > 0.8: # Should roughly match the swerve out time
+                    autonomy_state = "FOLLOW_RIGHT"
+                    # CRITICAL: Reset PID memory so it doesn't violently jerk the wheel
+                    pid_state["integral"] = 0.0 
+                    pid_state["last_error"] = 0.0
                     
             elif autonomy_state == "FOLLOW_RIGHT":
+                # 3. Resume normal computer vision tracking in the new lane
                 car.steer(steer)
                 car.forward(s_copy["speed"])
-                elapsed = time.time() - pid_state["state_start_time"]
-                if elapsed > 5.0:
-                    autonomy_state = "CHECKING"
-                    
-            elif autonomy_state == "CHECKING":
-                car.steer(steer)
-                car.forward(s_copy["speed"])
-                # Wait until safe left distance (e.g. > 250mm) or 0 (no object)
+                
+                # Check left sensor to see if it is safe to return to the original lane
                 if lidar_closest_left > 250 or lidar_closest_left == 0.0:
-                    autonomy_state = "RECOVERY"
-                    pid_state["state_start_time"] = time.time()
-                    
-            elif autonomy_state == "RECOVERY":
-                car.steer(-0.5)
-                car.forward(s_copy["speed"])
-                elapsed = time.time() - pid_state["state_start_time"]
-                if elapsed > 1.5 and lane_found:
-                    autonomy_state = "FOLLOW"
-                    
-            # Update steer based on what we actually apply
-            if autonomy_state == "OVERTAKING": steer = 0.5
-            elif autonomy_state == "RECOVERY": steer = -0.5
-        else:
-            car.stop()
-            autonomy_state = "FOLLOW"
+                    # You can trigger your RECOVERY S-Curve here later
+                    pass
 
         with state_lock:
             state["error"]         = round(error, 3)
