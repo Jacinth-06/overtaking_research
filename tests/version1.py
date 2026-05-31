@@ -736,17 +736,39 @@ def set_param():
     return jsonify({"ok": True})
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Robust Entry Point with Hardware Failsafe ───────────────────────────────
 if __name__ == "__main__":
-    car = JetRacer(init_lidar=True)
-    car.arm(delay=3)
+    car = None
+    try:
+        # Initialize hardware
+        car = JetRacer(init_lidar=True)
+        car.arm(delay=3)
 
-    # Lidar runs in its own thread — never blocks the camera loop
-    lt = threading.Thread(target=lidar_loop, args=(car,), daemon=True)
-    lt.start()
+        # Launch background threads with explicit daemon status
+        lt = threading.Thread(target=lidar_loop, args=(car,), daemon=True)
+        lt.start()
 
-    t = threading.Thread(target=control_loop, args=(car,), daemon=True)
-    t.start()
+        t = threading.Thread(target=control_loop, args=(car,), daemon=True)
+        t.start()
 
-    print("[flask] Dashboard → http://0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
+        print("[flask] Dashboard live → http://0.0.0.0:5000")
+        # Run Flask server
+        app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
+
+     Cinderella = True
+    except KeyboardInterrupt:
+        print("\n[shutdown] Ctrl+C detected. Terminating safely...")
+    
+    except Exception as e:
+        print(f"\n[crash] Critical unexpected crash: {e}")
+        
+    finally:
+        # THIS IS CRITICAL: This block guarantees execution during ANY termination
+        if car is not None:
+            print("[cleanup] Resetting hardware registers. Forcing car.stop()...")
+            try:
+                car.stop()   # Kills the drive throttle PWM signal
+                car.steer(0.0) # Straightens the front steering wheels
+            except Exception as hardware_error:
+                print(f"Failed to communicate with I2C bus during shutdown: {hardware_error}")
+        print("[cleanup] System fully disarmed. Safe to close terminal.")
