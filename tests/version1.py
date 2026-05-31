@@ -410,7 +410,7 @@ def control_loop(car: JetRacer):
                     
             elif autonomy_state == "SWERVE_OUT":
                 # 1. Turn HARD RIGHT to escape the obstacle
-                car.steer(1.0) # Full right steering lock!
+                car.steer(0.8) # Full right steering lock!
                 car.forward(s_copy["speed"])
                 
                 elapsed = time.time() - pid_state["state_start_time"]
@@ -420,7 +420,7 @@ def control_loop(car: JetRacer):
                     
             elif autonomy_state == "STRAIGHTEN_UP":
                 # 2. Turn HARD LEFT to counter-steer and straighten out
-                car.steer(-1.0) # Full left steering lock!
+                car.steer(-0.8) # Full left steering lock!
                 car.forward(s_copy["speed"])
                 
                 elapsed = time.time() - pid_state["state_start_time"]
