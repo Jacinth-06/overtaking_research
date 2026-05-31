@@ -447,7 +447,7 @@ def control_loop(car: JetRacer):
                 # PHASE 3: Wait for a brand new right lane to appear on the right side of the screen
                 elif phase == 3:
                     target_lw = pid_state.get("nominal_lane_width", 200.0)
-                    if right_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
+                    if right_found and (target_lw * 0.8 < lane_width < target_lw * 1.2):
                         autonomy_state = "CHECKING"
                         pid_state["crossing_phase"] = 1
                         print(f"\n[STATE CHANGE] -> CHECKING. Switched to right lane. Width: {lane_width:.1f}", flush=True)
