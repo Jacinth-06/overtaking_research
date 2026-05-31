@@ -220,8 +220,6 @@ def process_frame(frame, s, annotate: bool):
     ys, xs = np.where(roi_mask > 0)
 
     lane_found = False
-    left_found = False
-    right_found = False
 
     # 7. PID
     if len(xs) > 50:
@@ -235,10 +233,7 @@ def process_frame(frame, s, annotate: bool):
         left_pixels = xs[xs < mid_point]
         right_pixels = xs[xs >= mid_point]
         
-        left_found = len(left_pixels) > 10
-        right_found = len(right_pixels) > 10
-        
-        if left_found and right_found:
+        if len(left_pixels) > 10 and len(right_pixels) > 10:
             # BOTH LANES DETECTED
             # Find the center of the left line and center of the right line individually
             left_x = np.mean(left_pixels) + x_start
@@ -300,7 +295,7 @@ def process_frame(frame, s, annotate: bool):
     else:
         annotated = frame
 
-    return annotated, error, steer, left_found, right_found
+    return annotated, error, steer, lane_found
 
 
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
@@ -382,8 +377,7 @@ def control_loop(car: JetRacer):
             has_clients = stream_clients > 0
 
         do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
-        annotated, error, steer, left_found, right_found = process_frame(frame, s_copy, do_annotate)
-        lane_found = left_found or right_found
+        annotated, error, steer, lane_found = process_frame(frame, s_copy, do_annotate)
 
         if do_annotate:
             _encode_pool.submit(_do_encode, annotated)
@@ -408,67 +402,65 @@ def control_loop(car: JetRacer):
         if s_copy["enabled"]:
             if autonomy_state == "FOLLOW":
                 if lidar_blocked:
-                    autonomy_state = "OVERTAKING"
-                    pid_state["crossing_phase"] = 1
-                    print(f"\n[STATE CHANGE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
-                    car.steer(0.5)
+                    autonomy_state = "SWERVE_OUT"
+                    pid_state["state_start_time"] = now
+                    print(f"\n[STATE CHANGE] -> SWERVE_OUT. Obstacle at {lidar_closest}mm", flush=True)
+                    # Use a safer steering angle (0.85) instead of 1.0 to prevent I2C brownouts
+                    car.steer(0.85)
                     car.forward(s_copy["speed"])
                 else:
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                     
-            elif autonomy_state == "OVERTAKING":
-                car.steer(0.5)
-                car.forward(s_copy["speed"])
-                # Wait for original lane to be lost, then wait for new lane to be found
-                phase = pid_state.get("crossing_phase", 1)
-                if phase == 1:
-                    if not left_found:
-                        pid_state["crossing_phase"] = 2
-                        print("\n[STATE CHANGE] OVERTAKING -> Phase 2 (lost old lane)", flush=True)
-                elif phase == 2:
-                    if left_found and right_found:
-                        autonomy_state = "CHECKING"
-                        pid_state["crossing_phase"] = 1
-                        print("\n[STATE CHANGE] -> CHECKING. Switched to right lane.", flush=True)
-                        pid_state["integral"] = 0.0
-                        pid_state["last_error"] = 0.0
+            elif autonomy_state == "SWERVE_OUT":
+                elapsed = now - pid_state["state_start_time"]
+                if elapsed > 9:  # Time spent swerving out
+                    autonomy_state = "STRAIGHTEN_UP"
+                    pid_state["state_start_time"] = now
+                    print(f"\n[STATE CHANGE] -> STRAIGHTEN_UP. Elapsed: {elapsed:.2f}s", flush=True)
+                    car.steer(-0.85)  # Counter-steer immediately
+                    car.forward(s_copy["speed"])
+                else:
+                    # Keep executing the swerve out safely without blocking other threads
+                    car.steer(0.85)
+                    car.forward(s_copy["speed"])
                     
-            elif autonomy_state == "CHECKING":
+            elif autonomy_state == "STRAIGHTEN_UP":
+                elapsed = now - pid_state["state_start_time"]
+                if elapsed > 5:
+                    autonomy_state = "FOLLOW_RIGHT"
+                    pid_state["state_start_time"] = now
+                    print(f"\n[STATE CHANGE] -> FOLLOW_RIGHT. Clear of obstacle.", flush=True)
+                    pid_state["integral"] = 0.0
+                    pid_state["last_error"] = 0.0
+                else:
+                    car.steer(-0.85)
+                    car.forward(s_copy["speed"])
+                    
+            elif autonomy_state == "FOLLOW_RIGHT":
+                # Actively track using camera in the parallel bypass path
                 car.steer(steer)
                 car.forward(s_copy["speed"])
-                # Wait until safe left distance (obstacle crossed)
-                phase = pid_state.get("crossing_phase", 1)
-                if phase == 1:
-                    # phase 1: detect obstacle on the left
-                    if lidar_closest_left > 0.0 and lidar_closest_left < 600.0:
-                        pid_state["crossing_phase"] = 2
-                        print(f"\n[STATE CHANGE] CHECKING -> Phase 2 (obstacle {lidar_closest_left}mm to left)", flush=True)
-                elif phase == 2:
-                    # phase 2: obstacle clears
-                    if lidar_closest_left == 0.0 or lidar_closest_left > 300.0:
-                        autonomy_state = "RECOVERY"
-                        pid_state["crossing_phase"] = 1
-                        print("\n[STATE CHANGE] -> RECOVERY. Left side clear.", flush=True)
+                
+                # If clear on the left, initiate recovery maneuver back to original lane
+                if lidar_closest_left > 300 or lidar_closest_left == 0.0:
+                    autonomy_state = "RECOVERY"
+                    pid_state["state_start_time"] = now
+                    print("\n[STATE CHANGE] -> RECOVERY. Left side clear.", flush=True)
                     
             elif autonomy_state == "RECOVERY":
-                car.steer(-0.5)
-                car.forward(s_copy["speed"])
-                phase = pid_state.get("crossing_phase", 1)
-                if phase == 1:
-                    if not right_found:
-                        pid_state["crossing_phase"] = 2
-                        print("\n[STATE CHANGE] RECOVERY -> Phase 2 (lost old right lane)", flush=True)
-                elif phase == 2:
-                    if left_found and right_found:
-                        autonomy_state = "FOLLOW"
-                        print("\n[STATE CHANGE] -> FOLLOW. Back in original lane.", flush=True)
-                        pid_state["integral"] = 0.0
-                        pid_state["last_error"] = 0.0
+                elapsed = now - pid_state["state_start_time"]
+                if elapsed > 5 and lane_found:
+                    autonomy_state = "FOLLOW"
+                    print("\n[STATE CHANGE] -> FOLLOW. Back in central lane.", flush=True)
+                else:
+                    car.steer(-0.85)
+                    car.forward(s_copy["speed"])
                     
             # Set telemetry steering monitor value based on current operational mode
-            if autonomy_state == "OVERTAKING": steer = 0.5
-            elif autonomy_state == "RECOVERY": steer = -0.5
+            if autonomy_state == "SWERVE_OUT": steer = 0.85
+            elif autonomy_state == "STRAIGHTEN_UP": steer = -0.85
+            elif autonomy_state == "RECOVERY": steer = -0.85
         else:
             car.stop()
             autonomy_state = "FOLLOW"
