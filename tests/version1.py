@@ -414,7 +414,7 @@ def control_loop(car: JetRacer):
                     
             elif autonomy_state == "SWERVE_OUT":
                 elapsed = now - pid_state["state_start_time"]
-                if elapsed > 0.8:  # Time spent swerving out
+                if elapsed > 4:  # Time spent swerving out
                     autonomy_state = "STRAIGHTEN_UP"
                     pid_state["state_start_time"] = now
                     print(f"\n[STATE CHANGE] -> STRAIGHTEN_UP. Elapsed: {elapsed:.2f}s", flush=True)
@@ -427,7 +427,7 @@ def control_loop(car: JetRacer):
                     
             elif autonomy_state == "STRAIGHTEN_UP":
                 elapsed = now - pid_state["state_start_time"]
-                if elapsed > 0.8:
+                if elapsed > 4:
                     autonomy_state = "FOLLOW_RIGHT"
                     pid_state["state_start_time"] = now
                     print(f"\n[STATE CHANGE] -> FOLLOW_RIGHT. Clear of obstacle.", flush=True)
@@ -450,7 +450,7 @@ def control_loop(car: JetRacer):
                     
             elif autonomy_state == "RECOVERY":
                 elapsed = now - pid_state["state_start_time"]
-                if elapsed > 0.8 and lane_found:
+                if elapsed > 4 and lane_found:
                     autonomy_state = "FOLLOW"
                     print("\n[STATE CHANGE] -> FOLLOW. Back in central lane.", flush=True)
                 else:
