@@ -419,40 +419,60 @@ def control_loop(car: JetRacer):
                 if lidar_blocked:
                     autonomy_state = "OVERTAKING"
                     pid_state["crossing_phase"] = 1
+                    pid_state.pop("phase_debounce_time", None) # Clear any old timers
                     print(f"\n[STATE CHANGE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
-                    car.steer(0.5)
+                    car.steer(0.8)                              # Aggressive lane change initiation
                     car.forward(s_copy["speed"])
                 else:
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                     
             elif autonomy_state == "OVERTAKING":
-                car.steer(0.5)
+                car.steer(0.8)                                  # Sharp right turn during overtaking
                 car.forward(s_copy["speed"])
                 
                 phase = pid_state.get("crossing_phase", 1)
+                now = time.time()
                 
-                # PHASE 1: Wait for original left lane to disappear off the left side of the screen
+                # PHASE 1: Wait for original left lane to disappear STABLY for 2 full seconds
                 if phase == 1:
                     if not left_found:
-                        pid_state["crossing_phase"] = 2
-                        print("\n[STATE CHANGE] OVERTAKING Phase 1 -> 2 (Lost old left lane)", flush=True)
+                        if "phase_debounce_time" not in pid_state:
+                            pid_state["phase_debounce_time"] = now
+                        elif now - pid_state["phase_debounce_time"] >= 2.0:
+                            pid_state["crossing_phase"] = 2
+                            pid_state.pop("phase_debounce_time", None) # reset timer for next phase
+                            print("\n[STATE CHANGE] OVERTAKING Phase 1 -> 2 (CONFIRMED lost old left lane)", flush=True)
+                    else:
+                        pid_state.pop("phase_debounce_time", None) # reset if line flickers back
                         
-                # PHASE 2: Wait for original right lane to cross the center of the camera to become the NEW left lane
+                # PHASE 2: Wait for original right lane to cross center and stay on the left half for 2 seconds
                 elif phase == 2:
                     if left_found:
-                        pid_state["crossing_phase"] = 3
-                        print("\n[STATE CHANGE] OVERTAKING Phase 2 -> 3 (Old right lane became new left lane)", flush=True)
+                        if "phase_debounce_time" not in pid_state:
+                            pid_state["phase_debounce_time"] = now
+                        elif now - pid_state["phase_debounce_time"] >= 2.0:
+                            pid_state["crossing_phase"] = 3
+                            pid_state.pop("phase_debounce_time", None)
+                            print("\n[STATE CHANGE] OVERTAKING Phase 2 -> 3 (CONFIRMED old right lane became new left)", flush=True)
+                    else:
+                        pid_state.pop("phase_debounce_time", None)
                         
-                # PHASE 3: Wait for a brand new right lane to appear on the right side of the screen
+                # PHASE 3: Wait for a brand new right lane to appear and stay stable for 2 seconds
                 elif phase == 3:
                     target_lw = pid_state.get("nominal_lane_width", 200.0)
-                    if right_found and (target_lw * 0.8 < lane_width < target_lw * 1.2):
-                        autonomy_state = "CHECKING"
-                        pid_state["crossing_phase"] = 1
-                        print(f"\n[STATE CHANGE] -> CHECKING. Switched to right lane. Width: {lane_width:.1f}", flush=True)
-                        pid_state["integral"] = 0.0
-                        pid_state["last_error"] = 0.0
+                    if right_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
+                        if "phase_debounce_time" not in pid_state:
+                            pid_state["phase_debounce_time"] = now
+                        elif now - pid_state["phase_debounce_time"] >= 2.0:
+                            autonomy_state = "CHECKING"
+                            pid_state["crossing_phase"] = 1
+                            pid_state.pop("phase_debounce_time", None)
+                            print(f"\n[STATE CHANGE] -> CHECKING. Switched to right lane safely. Width: {lane_width:.1f}", flush=True)
+                            pid_state["integral"] = 0.0
+                            pid_state["last_error"] = 0.0
+                    else:
+                        pid_state.pop("phase_debounce_time", None)
                     
             elif autonomy_state == "CHECKING":
                 car.steer(steer)
@@ -469,39 +489,59 @@ def control_loop(car: JetRacer):
                     if lidar_closest_left == 0.0 or lidar_closest_left > 300.0:
                         autonomy_state = "RECOVERY"
                         pid_state["crossing_phase"] = 1
+                        pid_state.pop("phase_debounce_time", None) # Clear timer for recovery
                         print("\n[STATE CHANGE] -> RECOVERY. Left side clear.", flush=True)
                     
             elif autonomy_state == "RECOVERY":
-                car.steer(-0.5)
+                car.steer(-0.8)                                 # Sharp left turn during recovery
                 car.forward(s_copy["speed"])
                 
                 phase = pid_state.get("crossing_phase", 1)
+                now = time.time()
                 
-                # PHASE 1: Wait for original right lane to disappear off the right side of the screen
+                # PHASE 1: Wait for right lane to disappear STABLY for 2 seconds
                 if phase == 1:
                     if not right_found:
-                        pid_state["crossing_phase"] = 2
-                        print("\n[STATE CHANGE] RECOVERY Phase 1 -> 2 (Lost old right lane)", flush=True)
+                        if "phase_debounce_time" not in pid_state:
+                            pid_state["phase_debounce_time"] = now
+                        elif now - pid_state["phase_debounce_time"] >= 2.0:
+                            pid_state["crossing_phase"] = 2
+                            pid_state.pop("phase_debounce_time", None)
+                            print("\n[STATE CHANGE] RECOVERY Phase 1 -> 2 (CONFIRMED lost old right lane)", flush=True)
+                    else:
+                        pid_state.pop("phase_debounce_time", None)
                         
-                # PHASE 2: Wait for original left lane to cross the center to become the NEW right lane
+                # PHASE 2: Wait for left lane to cross center and become the new right lane for 2 seconds
                 elif phase == 2:
                     if right_found:
-                        pid_state["crossing_phase"] = 3
-                        print("\n[STATE CHANGE] RECOVERY Phase 2 -> 3 (Old left lane became new right lane)", flush=True)
+                        if "phase_debounce_time" not in pid_state:
+                            pid_state["phase_debounce_time"] = now
+                        elif now - pid_state["phase_debounce_time"] >= 2.0:
+                            pid_state["crossing_phase"] = 3
+                            pid_state.pop("phase_debounce_time", None)
+                            print("\n[STATE CHANGE] RECOVERY Phase 2 -> 3 (CONFIRMED old left lane became new right)", flush=True)
+                    else:
+                        pid_state.pop("phase_debounce_time", None)
                         
-                # PHASE 3: Wait for a brand new left lane to appear on the left side of the screen
+                # PHASE 3: Wait for a brand new left lane to appear stably for 2 seconds
                 elif phase == 3:
                     target_lw = pid_state.get("nominal_lane_width", 200.0)
                     if left_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
-                        autonomy_state = "FOLLOW"
-                        pid_state["crossing_phase"] = 1
-                        print(f"\n[STATE CHANGE] -> FOLLOW. Back in original lane. Width: {lane_width:.1f}", flush=True)
-                        pid_state["integral"] = 0.0
-                        pid_state["last_error"] = 0.0
+                        if "phase_debounce_time" not in pid_state:
+                            pid_state["phase_debounce_time"] = now
+                        elif now - pid_state["phase_debounce_time"] >= 2.0:
+                            autonomy_state = "FOLLOW"
+                            pid_state["crossing_phase"] = 1
+                            pid_state.pop("phase_debounce_time", None)
+                            print(f"\n[STATE CHANGE] -> FOLLOW. Back in original lane safely. Width: {lane_width:.1f}", flush=True)
+                            pid_state["integral"] = 0.0
+                            pid_state["last_error"] = 0.0
+                    else:
+                        pid_state.pop("phase_debounce_time", None)
                     
             # Set telemetry steering monitor value based on current operational mode
-            if autonomy_state == "OVERTAKING": steer = 0.5
-            elif autonomy_state == "RECOVERY": steer = -0.5
+            if autonomy_state == "OVERTAKING": steer = 0.8
+            elif autonomy_state == "RECOVERY": steer = -0.8
         else:
             car.stop()
             autonomy_state = "FOLLOW"
