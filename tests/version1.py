@@ -451,7 +451,7 @@ def control_loop(car: JetRacer):
                     if left_found:
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 1.0:
+                        elif now - pid_state["phase_debounce_time"] >= 0.5:
                             pid_state["crossing_phase"] = 3
                             pid_state.pop("phase_debounce_time", None)
                             print("\n[STATE CHANGE] OVERTAKING Phase 2 -> 3 (CONFIRMED old right lane became new left)", flush=True)
@@ -463,7 +463,7 @@ def control_loop(car: JetRacer):
                     if right_found:
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 1.0:
+                        elif now - pid_state["phase_debounce_time"] >= 0.5:
                             autonomy_state = "CHECKING"
                             pid_state["crossing_phase"] = 1
                             pid_state.pop("phase_debounce_time", None)
@@ -527,7 +527,7 @@ def control_loop(car: JetRacer):
                         if right_found:
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
-                            elif now - pid_state["phase_debounce_time"] >= 1.0:
+                            elif now - pid_state["phase_debounce_time"] >= 0.5:
                                 pid_state["crossing_phase"] = 3
                                 pid_state.pop("phase_debounce_time", None)
                                 print("\n[STATE CHANGE] RECOVERY Phase 2 -> 3 (CONFIRMED old left lane became new right)", flush=True)
@@ -539,7 +539,7 @@ def control_loop(car: JetRacer):
                         if left_found:
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
-                            elif now - pid_state["phase_debounce_time"] >= 1.0:
+                            elif now - pid_state["phase_debounce_time"] >= 0.5:
                                 autonomy_state = "FOLLOW"
                                 pid_state["crossing_phase"] = 1
                                 pid_state.pop("phase_debounce_time", None)
