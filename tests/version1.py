@@ -405,8 +405,8 @@ def control_loop(car: JetRacer):
                     autonomy_state = "SWERVE_OUT"
                     pid_state["state_start_time"] = now
                     print(f"\n[STATE CHANGE] -> SWERVE_OUT. Obstacle at {lidar_closest}mm", flush=True)
-                    # Use a safer steering angle (0.75) instead of 1.0 to prevent I2C brownouts
-                    car.steer(0.75) 
+                    # Use a safer steering angle (0.85) instead of 1.0 to prevent I2C brownouts
+                    car.steer(0.85)
                     car.forward(s_copy["speed"])
                 else:
                     car.steer(steer)
@@ -414,27 +414,27 @@ def control_loop(car: JetRacer):
                     
             elif autonomy_state == "SWERVE_OUT":
                 elapsed = now - pid_state["state_start_time"]
-                if elapsed > 4:  # Time spent swerving out
+                if elapsed > 7:  # Time spent swerving out
                     autonomy_state = "STRAIGHTEN_UP"
                     pid_state["state_start_time"] = now
                     print(f"\n[STATE CHANGE] -> STRAIGHTEN_UP. Elapsed: {elapsed:.2f}s", flush=True)
-                    car.steer(-0.75)  # Counter-steer immediately
+                    car.steer(-0.85)  # Counter-steer immediately
                     car.forward(s_copy["speed"])
                 else:
                     # Keep executing the swerve out safely without blocking other threads
-                    car.steer(0.75)
+                    car.steer(0.85)
                     car.forward(s_copy["speed"])
                     
             elif autonomy_state == "STRAIGHTEN_UP":
                 elapsed = now - pid_state["state_start_time"]
-                if elapsed > 4:
+                if elapsed > 7:
                     autonomy_state = "FOLLOW_RIGHT"
                     pid_state["state_start_time"] = now
                     print(f"\n[STATE CHANGE] -> FOLLOW_RIGHT. Clear of obstacle.", flush=True)
                     pid_state["integral"] = 0.0
                     pid_state["last_error"] = 0.0
                 else:
-                    car.steer(-0.75)
+                    car.steer(-0.85)
                     car.forward(s_copy["speed"])
                     
             elif autonomy_state == "FOLLOW_RIGHT":
@@ -450,17 +450,17 @@ def control_loop(car: JetRacer):
                     
             elif autonomy_state == "RECOVERY":
                 elapsed = now - pid_state["state_start_time"]
-                if elapsed > 4 and lane_found:
+                if elapsed > 7 and lane_found:
                     autonomy_state = "FOLLOW"
                     print("\n[STATE CHANGE] -> FOLLOW. Back in central lane.", flush=True)
                 else:
-                    car.steer(-0.75)
+                    car.steer(-0.85)
                     car.forward(s_copy["speed"])
                     
             # Set telemetry steering monitor value based on current operational mode
-            if autonomy_state == "SWERVE_OUT": steer = 0.75
-            elif autonomy_state == "STRAIGHTEN_UP": steer = -0.75
-            elif autonomy_state == "RECOVERY": steer = -0.75
+            if autonomy_state == "SWERVE_OUT": steer = 0.85
+            elif autonomy_state == "STRAIGHTEN_UP": steer = -0.85
+            elif autonomy_state == "RECOVERY": steer = -0.85
         else:
             car.stop()
             autonomy_state = "FOLLOW"
