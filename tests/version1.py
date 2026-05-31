@@ -75,10 +75,12 @@ state = {
     "error": 0.0, "steer": 0.0, "fps": 0,
     "lane_found": False,
     "lidar_closest": 0.0,     # closest front distance in mm
+    "lidar_closest_left": 0.0, # closest left distance in mm
     "lidar_blocked": False,   # True when obstacle within stop_distance
+    "autonomy_state": "FOLLOW",
 }
 
-pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
+pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time(), "state_start_time": time.time()}
 state_lock = threading.Lock()
 
 _last_steer = 0.0
@@ -311,79 +313,42 @@ def _do_encode(img):
 # The control loop does a cheap non-blocking dict read instead of calling
 # car.lidar_scan() every frame (which was the main FPS killer).
 
-_lidar_cache      = {"closest": 0.0, "blocked": False}
+_lidar_cache      = {"closest": 0.0, "closest_left": 0.0, "blocked": False}
 _lidar_cache_lock = threading.Lock()
 
 def lidar_loop(car: JetRacer):
     """
     Background thread: poll lidar and cache the result.
-    Mirrors the exact logic of the standalone safety_stop.py script:
-      - Initial scan: 120 samples, front cone 320°–360° + 0°–40°
-      - Recovery scan: 100 samples, tighter cone 340°–360° + 0°–20°
-      - Blocks in a tight 0.5 s loop until path is clear, then resumes
-      - If Lidar misses a frame (empty front list), stop for safety
+    Scans front (320-360, 0-40) and left (250-310) continuously.
+    Does not block the control loop.
     """
     print("[lidar] Background safety thread started")
     while True:
         try:
-            # Fetch threshold dynamically from global state to keep dashboard working
             with state_lock:
                 STOP_DISTANCE = state["stop_distance"]
 
-            # 1. Get a quick scan
-            scan = car.lidar_scan(samples=120) # Using fewer samples for faster reaction
+            # Use enough samples to get good coverage for both front and left
+            scan = car.lidar_scan(samples=150)
             
-            # 2. Extract the minimum distance in the front 40-degree cone
-            # Angles: 320-359 and 0-40
-            front_distances = [dist for ang, dist in scan.items() if ang >= 320 or ang <= 40]
+            front_distances = [dist for ang, dist in scan.items() if (ang >= 320 or ang <= 40) and dist > 10]
+            left_distances = [dist for ang, dist in scan.items() if (250 <= ang <= 310) and dist > 10]
             
-            if front_distances:
-                closest_front = min(front_distances)
-                print(f"Distance Ahead: {closest_front:.1f}mm", end='\r')
+            closest_front = min(front_distances) if front_distances else 0.0
+            closest_left = min(left_distances) if left_distances else 0.0
+            
+            is_blocked = closest_front > 0 and closest_front < STOP_DISTANCE
+            
+            with _lidar_cache_lock:
+                _lidar_cache["closest"] = round(closest_front, 1)
+                _lidar_cache["closest_left"] = round(closest_left, 1)
+                _lidar_cache["blocked"] = is_blocked
                 
-                # 3. Decision Logic
-                if closest_front < STOP_DISTANCE:
-                    car.stop()
-                    print(f"\n[!] EMERGENCY STOP: Object at {closest_front:.1f}mm")
-
-                    # Update cache IMMEDIATELY so control_loop sees blocked=True
-                    # and doesn't override our car.stop() with car.forward()
-                    with _lidar_cache_lock:
-                        _lidar_cache["closest"] = round(closest_front, 1)
-                        _lidar_cache["blocked"] = True
-
-                    # Wait until path is clear or script is exited
-                    while closest_front < STOP_DISTANCE:
-                        time.sleep(0.5)
-                        # Re-check
-                        new_scan = car.lidar_scan(samples=100)
-                        new_front = [d for a, d in new_scan.items() if a >= 340 or a <= 20]
-                        closest_front = min(new_front) if new_front else 0
-
-                        # Keep cache updated during recovery so dashboard shows live distance
-                        with _lidar_cache_lock:
-                            _lidar_cache["closest"] = round(closest_front, 1)
-                            _lidar_cache["blocked"] = True
-
-                    print("\n[+] Path clear. Resuming...")
-                    with _lidar_cache_lock:
-                        _lidar_cache["closest"] = round(closest_front, 1)
-                        _lidar_cache["blocked"] = False
-                else:
-                    with _lidar_cache_lock:
-                        _lidar_cache["closest"] = round(closest_front, 1)
-                        _lidar_cache["blocked"] = False
-            else:
-                # If Lidar misses a frame, stop for safety
-                car.stop()
-                with _lidar_cache_lock:
-                    _lidar_cache["closest"] = 0.0
-                    _lidar_cache["blocked"] = True
-
         except Exception as e:
             print(f"[lidar] scan error: {e}")
             with _lidar_cache_lock:
                 _lidar_cache["closest"] = 0.0
+                _lidar_cache["closest_left"] = 0.0
                 _lidar_cache["blocked"] = True
 
         time.sleep(0.10)   # ~10 Hz — fast enough for obstacle reaction
@@ -429,23 +394,68 @@ def control_loop(car: JetRacer):
         # ── Non-blocking lidar read (result produced by lidar_loop thread) ──
         with _lidar_cache_lock:
             lidar_closest = _lidar_cache["closest"]
+            lidar_closest_left = _lidar_cache.get("closest_left", 0.0)
             lidar_blocked = _lidar_cache["blocked"]
 
+        autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
+
         if s_copy["enabled"]:
-            if lidar_blocked:
-                car.stop()
-            else:
+            if autonomy_state == "FOLLOW":
+                if lidar_blocked:
+                    autonomy_state = "OVERTAKING"
+                    pid_state["state_start_time"] = time.time()
+                    car.steer(0.5)
+                    car.forward(s_copy["speed"])
+                else:
+                    car.steer(steer)
+                    car.forward(s_copy["speed"])
+                    
+            elif autonomy_state == "OVERTAKING":
+                car.steer(0.5)
+                car.forward(s_copy["speed"])
+                # Wait for 1.5 seconds min to allow crossing, then transition when lane is found again
+                elapsed = time.time() - pid_state["state_start_time"]
+                if elapsed > 1.5 and lane_found:
+                    autonomy_state = "FOLLOW_RIGHT"
+                    pid_state["state_start_time"] = time.time()
+                    
+            elif autonomy_state == "FOLLOW_RIGHT":
                 car.steer(steer)
                 car.forward(s_copy["speed"])
+                elapsed = time.time() - pid_state["state_start_time"]
+                if elapsed > 5.0:
+                    autonomy_state = "CHECKING"
+                    
+            elif autonomy_state == "CHECKING":
+                car.steer(steer)
+                car.forward(s_copy["speed"])
+                # Wait until safe left distance (e.g. > 250mm) or 0 (no object)
+                if lidar_closest_left > 250 or lidar_closest_left == 0.0:
+                    autonomy_state = "RECOVERY"
+                    pid_state["state_start_time"] = time.time()
+                    
+            elif autonomy_state == "RECOVERY":
+                car.steer(-0.5)
+                car.forward(s_copy["speed"])
+                elapsed = time.time() - pid_state["state_start_time"]
+                if elapsed > 1.5 and lane_found:
+                    autonomy_state = "FOLLOW"
+                    
+            # Update steer based on what we actually apply
+            if autonomy_state == "OVERTAKING": steer = 0.5
+            elif autonomy_state == "RECOVERY": steer = -0.5
         else:
             car.stop()
+            autonomy_state = "FOLLOW"
 
         with state_lock:
             state["error"]         = round(error, 3)
             state["steer"]         = round(steer, 3)
             state["lane_found"]    = lane_found
             state["lidar_closest"] = lidar_closest
+            state["lidar_closest_left"] = lidar_closest_left
             state["lidar_blocked"] = lidar_blocked
+            state["autonomy_state"] = autonomy_state
 
         frame_idx += 1
 
@@ -519,6 +529,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h2>Camera feed (annotated)</h2>
     <img id="feed" src="/video_feed" alt="camera">
     <div class="status-bar" style="margin-top:.75rem">
+      <div class="stat"><span class="stat-val" id="v-state">FOLLOW</span>
+                        <span class="stat-lbl">state</span></div>
       <div class="stat"><span class="stat-val" id="v-fps">0</span>
                         <span class="stat-lbl">fps</span></div>
       <div class="stat"><span class="stat-val" id="v-err">0.00</span>
@@ -528,9 +540,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat"><span class="stat-val" id="v-lane">&mdash;</span>
                         <span class="stat-lbl">lane</span></div>
       <div class="stat"><span class="stat-val" id="v-lidar">0</span>
-                        <span class="stat-lbl">lidar mm</span></div>
-      <div class="stat"><span class="stat-val" id="v-blocked">&mdash;</span>
-                        <span class="stat-lbl">blocked</span></div>
+                        <span class="stat-lbl">lidar front</span></div>
+      <div class="stat"><span class="stat-val" id="v-lidar-left">0</span>
+                        <span class="stat-lbl">lidar left</span></div>
     </div>
     <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
@@ -655,6 +667,7 @@ async function poll() {
   try {
     const r = await fetch("/status");
     const d = await r.json();
+    document.getElementById("v-state").textContent = d.autonomy_state;
     document.getElementById("v-fps").textContent  = d.fps;
     document.getElementById("v-err").textContent  = d.error.toFixed(2);
     document.getElementById("v-str").textContent  = d.steer.toFixed(2);
@@ -665,10 +678,9 @@ async function poll() {
 
     const lidarEl = document.getElementById("v-lidar");
     lidarEl.textContent = d.lidar_closest.toFixed(0);
-
-    const blockedEl = document.getElementById("v-blocked");
-    blockedEl.textContent = d.lidar_blocked ? "⚠ YES" : "OK";
-    blockedEl.style.color = d.lidar_blocked ? "#ff4d4d" : "#00d4aa";
+    
+    const lidarLeftEl = document.getElementById("v-lidar-left");
+    lidarLeftEl.textContent = d.lidar_closest_left.toFixed(0);
 
     const pct = (d.error + 1) / 2 * 100;
     const bar = document.getElementById("error-bar");
@@ -716,7 +728,7 @@ def status():
     with state_lock:
         return jsonify({k: state[k] for k in
                         ("fps", "error", "steer", "lane_found", "enabled",
-                         "lidar_closest", "lidar_blocked")})
+                         "lidar_closest", "lidar_closest_left", "lidar_blocked", "autonomy_state")})
 
 
 @app.route("/set", methods=["POST"])
