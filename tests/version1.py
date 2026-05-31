@@ -451,24 +451,23 @@ def control_loop(car: JetRacer):
                     if left_found:
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 0.5:
+                        elif now - pid_state["phase_debounce_time"] >= 1.0:
                             pid_state["crossing_phase"] = 3
                             pid_state.pop("phase_debounce_time", None)
                             print("\n[STATE CHANGE] OVERTAKING Phase 2 -> 3 (CONFIRMED old right lane became new left)", flush=True)
                     else:
                         pid_state.pop("phase_debounce_time", None)
                         
-                # PHASE 3: Wait for a brand new right lane to appear stably for 1 full second
+                # PHASE 3: Wait for a brand new right lane to appear stably for 1 full second (LANE WIDTH CHECK REMOVED)
                 elif phase == 3:
-                    target_lw = pid_state.get("nominal_lane_width", 200.0)
-                    if right_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
+                    if right_found:
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 0.5:
+                        elif now - pid_state["phase_debounce_time"] >= 1.0:
                             autonomy_state = "CHECKING"
                             pid_state["crossing_phase"] = 1
                             pid_state.pop("phase_debounce_time", None)
-                            print(f"\n[STATE CHANGE] -> CHECKING. Switched to right lane safely. Width: {lane_width:.1f}", flush=True)
+                            print("\n[STATE CHANGE] -> CHECKING. Switched to right lane safely.", flush=True)
                             pid_state["integral"] = 0.0
                             pid_state["last_error"] = 0.0
                     else:
@@ -535,17 +534,16 @@ def control_loop(car: JetRacer):
                         else:
                             pid_state.pop("phase_debounce_time", None)
                             
-                    # PHASE 3: Wait for a brand new left lane to appear stably for 1 full second
+                    # PHASE 3: Wait for a brand new left lane to appear stably for 1 full second (LANE WIDTH CHECK REMOVED)
                     elif phase == 3:
-                        target_lw = pid_state.get("nominal_lane_width", 200.0)
-                        if left_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
+                        if left_found:
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
                             elif now - pid_state["phase_debounce_time"] >= 1.0:
                                 autonomy_state = "FOLLOW"
                                 pid_state["crossing_phase"] = 1
                                 pid_state.pop("phase_debounce_time", None)
-                                print(f"\n[STATE CHANGE] -> FOLLOW. Back in original lane safely. Width: {lane_width:.1f}", flush=True)
+                                print("\n[STATE CHANGE] -> FOLLOW. Back in original lane safely.", flush=True)
                                 pid_state["integral"] = 0.0
                                 pid_state["last_error"] = 0.0
                         else:
