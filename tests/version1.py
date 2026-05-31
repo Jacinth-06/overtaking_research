@@ -238,6 +238,8 @@ def process_frame(frame, s, annotate: bool):
         left_found = len(left_pixels) > 10
         right_found = len(right_pixels) > 10
         
+        lane_width = 0.0
+
         if left_found and right_found:
             # BOTH LANES DETECTED
             # Find the center of the left line and center of the right line individually
@@ -246,6 +248,7 @@ def process_frame(frame, s, annotate: bool):
             
             # The true centroid is exactly between the two lines
             target_x = (left_x + right_x) / 2.0
+            lane_width = right_x - left_x
             
         elif len(left_pixels) > 10:
             # ONLY LEFT LANE DETECTED (e.g., sharp left turn)
@@ -300,7 +303,7 @@ def process_frame(frame, s, annotate: bool):
     else:
         annotated = frame
 
-    return annotated, error, steer, left_found, right_found
+    return annotated, error, steer, left_found, right_found, lane_width
 
 
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
@@ -382,7 +385,7 @@ def control_loop(car: JetRacer):
             has_clients = stream_clients > 0
 
         do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
-        annotated, error, steer, left_found, right_found = process_frame(frame, s_copy, do_annotate)
+        annotated, error, steer, left_found, right_found, lane_width = process_frame(frame, s_copy, do_annotate)
         lane_found = left_found or right_found
 
         if do_annotate:
@@ -407,6 +410,11 @@ def control_loop(car: JetRacer):
         # 3. STATE MACHINE (Strictly IF/ELIF, NO WHILE LOOPS)
         if s_copy["enabled"]:
             if autonomy_state == "FOLLOW":
+                # Track nominal lane width
+                if left_found and right_found and lane_width > 50:
+                    old_lw = pid_state.get("nominal_lane_width", lane_width)
+                    pid_state["nominal_lane_width"] = 0.95 * old_lw + 0.05 * lane_width
+
                 if lidar_blocked:
                     autonomy_state = "OVERTAKING"
                     pid_state["crossing_phase"] = 1
@@ -427,10 +435,12 @@ def control_loop(car: JetRacer):
                         pid_state["crossing_phase"] = 2
                         print("\n[STATE CHANGE] OVERTAKING -> Phase 2 (lost old lane)", flush=True)
                 elif phase == 2:
-                    if left_found and right_found:
+                    target_lw = pid_state.get("nominal_lane_width", 200.0)
+                    # Check if both lanes are visible and lane width is within 40% margin
+                    if left_found and right_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
                         autonomy_state = "CHECKING"
                         pid_state["crossing_phase"] = 1
-                        print("\n[STATE CHANGE] -> CHECKING. Switched to right lane.", flush=True)
+                        print(f"\n[STATE CHANGE] -> CHECKING. Switched to right lane. Width: {lane_width:.1f}", flush=True)
                         pid_state["integral"] = 0.0
                         pid_state["last_error"] = 0.0
                     
@@ -460,9 +470,10 @@ def control_loop(car: JetRacer):
                         pid_state["crossing_phase"] = 2
                         print("\n[STATE CHANGE] RECOVERY -> Phase 2 (lost old right lane)", flush=True)
                 elif phase == 2:
-                    if left_found and right_found:
+                    target_lw = pid_state.get("nominal_lane_width", 200.0)
+                    if left_found and right_found and (target_lw * 0.6 < lane_width < target_lw * 1.4):
                         autonomy_state = "FOLLOW"
-                        print("\n[STATE CHANGE] -> FOLLOW. Back in original lane.", flush=True)
+                        print(f"\n[STATE CHANGE] -> FOLLOW. Back in original lane. Width: {lane_width:.1f}", flush=True)
                         pid_state["integral"] = 0.0
                         pid_state["last_error"] = 0.0
                     
