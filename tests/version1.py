@@ -354,7 +354,6 @@ def lidar_loop(car: JetRacer):
         time.sleep(0.10)   # ~10 Hz — fast enough for obstacle reaction
 
 
-# ── Control loop ──────────────────────────────────────────────────────────────
 def control_loop(car: JetRacer):
     cap = open_camera()
     fps_counter, fps_time = 0, time.time()
@@ -367,12 +366,10 @@ def control_loop(car: JetRacer):
             time.sleep(0.01)
             continue
 
-        if len(frame.shape) != 3:
-            continue
-
         if frame.shape[0] != HEIGHT or frame.shape[1] != WIDTH:
             frame = cv2.resize(frame, (WIDTH, HEIGHT))
 
+        # 1. Grab a quick snapshot of the state and RELEASE the lock immediately
         with state_lock:
             s_copy = dict(state)
 
@@ -391,55 +388,84 @@ def control_loop(car: JetRacer):
                 state["fps"] = fps_counter
             fps_counter, fps_time = 0, time.time()
 
-        # ── Non-blocking lidar read (result produced by lidar_loop thread) ──
+        # 2. Get Lidar readings from RAM cache (Ultra-fast, non-blocking)
         with _lidar_cache_lock:
             lidar_closest = _lidar_cache["closest"]
             lidar_closest_left = _lidar_cache.get("closest_left", 0.0)
             lidar_blocked = _lidar_cache["blocked"]
 
+        # Track state using our local copy baseline
         autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
+        now = time.time()
 
+        # 3. STATE MACHINE (Strictly IF/ELIF, NO WHILE LOOPS)
         if s_copy["enabled"]:
             if autonomy_state == "FOLLOW":
                 if lidar_blocked:
                     autonomy_state = "SWERVE_OUT"
-                    pid_state["state_start_time"] = time.time()
+                    pid_state["state_start_time"] = now
+                    print(f"\n[STATE CHANGE] -> SWERVE_OUT. Obstacle at {lidar_closest}mm", flush=True)
+                    # Use a safer steering angle (0.75) instead of 1.0 to prevent I2C brownouts
+                    car.steer(0.75) 
+                    car.forward(s_copy["speed"])
                 else:
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                     
             elif autonomy_state == "SWERVE_OUT":
-                # 1. Turn HARD RIGHT to escape the obstacle
-                car.steer(0.8) # Full right steering lock!
-                car.forward(s_copy["speed"])
-                
-                elapsed = time.time() - pid_state["state_start_time"]
-                if elaps: # Adjust this time based on how wide your lane is
+                elapsed = now - pid_state["state_start_time"]
+                if elapsed > 0.8:  # Time spent swerving out
                     autonomy_state = "STRAIGHTEN_UP"
-                    pid_state["state_start_time"] = time.time()
+                    pid_state["state_start_time"] = now
+                    print(f"\n[STATE CHANGE] -> STRAIGHTEN_UP. Elapsed: {elapsed:.2f}s", flush=True)
+                    car.steer(-0.75)  # Counter-steer immediately
+                    car.forward(s_copy["speed"])
+                else:
+                    # Keep executing the swerve out safely without blocking other threads
+                    car.steer(0.75)
+                    car.forward(s_copy["speed"])
                     
             elif autonomy_state == "STRAIGHTEN_UP":
-                # 2. Turn HARD LEFT to counter-steer and straighten out
-                car.steer(-0.8) # Full left steering lock!
-                car.forward(s_copy["speed"])
-                
-                elapsed = time.time() - pid_state["state_start_time"]
-                if elapsed > 0.8: # Should roughly match the swerve out time
+                elapsed = now - pid_state["state_start_time"]
+                if elapsed > 0.8:
                     autonomy_state = "FOLLOW_RIGHT"
-                    # CRITICAL: Reset PID memory so it doesn't violently jerk the wheel
-                    pid_state["integral"] = 0.0 
+                    pid_state["state_start_time"] = now
+                    print(f"\n[STATE CHANGE] -> FOLLOW_RIGHT. Clear of obstacle.", flush=True)
+                    pid_state["integral"] = 0.0
                     pid_state["last_error"] = 0.0
+                else:
+                    car.steer(-0.75)
+                    car.forward(s_copy["speed"])
                     
             elif autonomy_state == "FOLLOW_RIGHT":
-                # 3. Resume normal computer vision tracking in the new lane
+                # Actively track using camera in the parallel bypass path
                 car.steer(steer)
                 car.forward(s_copy["speed"])
                 
-                # Check left sensor to see if it is safe to return to the original lane
-                if lidar_closest_left > 250 or lidar_closest_left == 0.0:
-                    # You can trigger your RECOVERY S-Curve here later
-                    pass
+                # If clear on the left, initiate recovery maneuver back to original lane
+                if lidar_closest_left > 300 or lidar_closest_left == 0.0:
+                    autonomy_state = "RECOVERY"
+                    pid_state["state_start_time"] = now
+                    print("\n[STATE CHANGE] -> RECOVERY. Left side clear.", flush=True)
+                    
+            elif autonomy_state == "RECOVERY":
+                elapsed = now - pid_state["state_start_time"]
+                if elapsed > 0.8 and lane_found:
+                    autonomy_state = "FOLLOW"
+                    print("\n[STATE CHANGE] -> FOLLOW. Back in central lane.", flush=True)
+                else:
+                    car.steer(-0.75)
+                    car.forward(s_copy["speed"])
+                    
+            # Set telemetry steering monitor value based on current operational mode
+            if autonomy_state == "SWERVE_OUT": steer = 0.75
+            elif autonomy_state == "STRAIGHTEN_UP": steer = -0.75
+            elif autonomy_state == "RECOVERY": steer = -0.75
+        else:
+            car.stop()
+            autonomy_state = "FOLLOW"
 
+        # 4. Save current state values back to global dictionary safely
         with state_lock:
             state["error"]         = round(error, 3)
             state["steer"]         = round(steer, 3)
@@ -452,7 +478,6 @@ def control_loop(car: JetRacer):
         frame_idx += 1
 
     cap.release()
-
 
 # ── Flask / dashboard ─────────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
