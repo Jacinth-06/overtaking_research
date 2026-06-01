@@ -539,6 +539,8 @@ def control_loop(car: JetRacer):
                         print("\n[STATE CHANGE] -> RECOVERY. Left side clear.", flush=True)
                     
             elif autonomy_state == "RECOVERY":
+                is_front_blocked = lidar_blocked
+                is_left_blocked = (lidar_closest_left > 0.0 and lidar_closest_left < 300.0)
                 if is_front_blocked or is_left_blocked:
                     car.steer(steer)
                     car.forward(s_copy["speed"])
