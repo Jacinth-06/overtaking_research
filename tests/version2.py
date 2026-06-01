@@ -450,11 +450,11 @@ def control_loop(car: JetRacer):
                 
                 # If we can see the right line, track relative to it!
                 if right_found:
-                    # Target is exactly one lane width to the left of the right line
-                    dynamic_target_x = right_x - lw
+                    # Target is exactly one lane width to the right of the right line
+                    dynamic_target_x = right_x + lw
                 elif left_found:
-                    # If we only see the left line, target is exactly one lane width to its left
-                    dynamic_target_x = left_x - lw
+                    # If we only see the left line, target is exactly one lane width to its right
+                    dynamic_target_x = left_x + lw
                 else:
                     # Blind fallback only if BOTH lines are totally lost mid-change
                     dynamic_target_x = (WIDTH / 2.0) + lw
@@ -548,9 +548,9 @@ def control_loop(car: JetRacer):
                     
                     # Track relative to lines to guide the car back safely
                     if left_found:
-                        dynamic_target_x = left_x + lw
+                        dynamic_target_x = left_x - lw
                     elif right_found:
-                        dynamic_target_x = right_x + lw
+                        dynamic_target_x = right_x - lw
                     else:
                         dynamic_target_x = (WIDTH / 2.0) - lw
 
