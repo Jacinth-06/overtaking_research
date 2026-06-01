@@ -408,31 +408,78 @@ def control_loop(car: JetRacer):
         autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
         now = time.time()
 
+        # Keep a continuous track of the lane width baseline while driving normally
+        if left_found and right_found and lane_width > 50:
+            old_lw = pid_state.get("nominal_lane_width", lane_width)
+            pid_state["nominal_lane_width"] = 0.95 * old_lw + 0.05 * lane_width
+
         # 3. STATE MACHINE (Strictly IF/ELIF, NO WHILE LOOPS)
         if s_copy["enabled"]:
             if autonomy_state == "FOLLOW":
-                # Track nominal lane width
-                if left_found and right_found and lane_width > 50:
-                    old_lw = pid_state.get("nominal_lane_width", lane_width)
-                    pid_state["nominal_lane_width"] = 0.95 * old_lw + 0.05 * lane_width
-
                 if lidar_blocked:
                     autonomy_state = "OVERTAKING"
                     pid_state["crossing_phase"] = 1
                     pid_state.pop("phase_debounce_time", None) # Clear any old timers
                     print(f"\n[STATE CHANGE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
-                    car.steer(0.8)                              
+                    
+                    # ── DYNAMIC OVERTAKE INITIALIZATION ──
+                    lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
+                    dynamic_target_x = (WIDTH / 2.0) + lw
+                    error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0) * 3.5
+                    
+                    dt = max(now - pid_state["last_time"], 0.001)
+                    pid_state["integral"] += error * dt
+                    derivative = (error - pid_state["last_error"]) / dt
+                    pid_state["last_error"] = error
+                    pid_state["last_time"] = now
+                    
+                    steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
+                    steer = max(-1.0, min(1.0, steer))
+                    car.steer(steer)
                     car.forward(s_copy["speed"])
                 else:
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                     
             elif autonomy_state == "OVERTAKING":
-                car.steer(0.8)                                  
+                # ── TRUE DYNAMIC STEER OVERTAKE ──
+                # Use the memory-cached lane width
+                lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
+                
+                # If we can see the right line, track relative to it!
+                if right_found and len(right_pixels) > 0:
+                    # Target is exactly one lane width to the left of the right line
+                    right_x = np.mean(right_pixels) + x_start
+                    dynamic_target_x = right_x - lw
+                elif left_found and len(left_pixels) > 0:
+                    # If we only see the left line, target is exactly one lane width to its left
+                    left_x = np.mean(left_pixels) + x_start
+                    dynamic_target_x = left_x - lw
+                else:
+                    # Blind fallback only if BOTH lines are totally lost mid-change
+                    dynamic_target_x = (WIDTH / 2.0) + lw
+
+                # Calculate live error against where the lines actually are right now!
+                error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0) * 3.5
+                
+                dt = max(now - pid_state["last_time"], 0.001)
+                pid_state["integral"] += error * dt
+                # Prevent integral windup from ruining the next state
+                pid_state["integral"] = max(-2.0, min(2.0, pid_state["integral"])) 
+                
+                derivative = (error - pid_state["last_error"]) / dt
+                pid_state["last_error"] = error
+                pid_state["last_time"] = now
+                
+                steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
+                steer = max(-1.0, min(1.0, steer))
+                
+                car.steer(steer)
                 car.forward(s_copy["speed"])
                 
+                # ... [Rest of your Phase 1, 2, 3 timer logic remains exactly identical] ...
+                
                 phase = pid_state.get("crossing_phase", 1)
-                now = time.time()
                 
                 # PHASE 1: Wait for original left lane to disappear STABLY for 2 full seconds
                 if phase == 1:
@@ -458,7 +505,7 @@ def control_loop(car: JetRacer):
                     else:
                         pid_state.pop("phase_debounce_time", None)
                         
-                # PHASE 3: Wait for a brand new right lane to appear stably for 1 full second (LANE WIDTH CHECK REMOVED)
+                # PHASE 3: Wait for a brand new right lane to appear stably for 1 full second
                 elif phase == 3:
                     if right_found:
                         if "phase_debounce_time" not in pid_state:
@@ -492,23 +539,42 @@ def control_loop(car: JetRacer):
                         print("\n[STATE CHANGE] -> RECOVERY. Left side clear.", flush=True)
                     
             elif autonomy_state == "RECOVERY":
-                # Check if a new obstacle appeared ahead OR if the left obstacle returned
-                is_front_blocked = lidar_blocked
-                is_left_blocked  = (0.0 < lidar_closest_left < 300.0)
-
                 if is_front_blocked or is_left_blocked:
-                    # NOT SAFE TO RETURN: Override hard turn and follow current lane line
                     car.steer(steer)
                     car.forward(s_copy["speed"])
-                    pid_state["crossing_phase"] = 1
-                    pid_state.pop("phase_debounce_time", None)
                 else:
-                    # SAFE: Execute normal recovery hard turn
-                    car.steer(-0.8)                                 
+                    # ── TRUE DYNAMIC RECOVERY STEER ──
+                    lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
+                    
+                    # Track relative to lines to guide the car back safely
+                    if left_found and len(left_pixels) > 0:
+                        left_x = np.mean(left_pixels) + x_start
+                        dynamic_target_x = left_x + lw
+                    elif right_found and len(right_pixels) > 0:
+                        right_x = np.mean(right_pixels) + x_start
+                        dynamic_target_x = right_x + lw
+                    else:
+                        dynamic_target_x = (WIDTH / 2.0) - lw
+
+                    error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0) * 3.5
+                    
+                    dt = max(now - pid_state["last_time"], 0.001)
+                    pid_state["integral"] += error * dt
+                    pid_state["integral"] = max(-2.0, min(2.0, pid_state["integral"]))
+                    
+                    derivative = (error - pid_state["last_error"]) / dt
+                    pid_state["last_error"] = error
+                    pid_state["last_time"] = now
+                    
+                    steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
+                    steer = max(-1.0, min(1.0, steer))
+                    
+                    car.steer(steer)
                     car.forward(s_copy["speed"])
                     
+                    # ... [Rest of your Phase 1, 2, 3 recovery logic remains exactly identical] ...
+                    
                     phase = pid_state.get("crossing_phase", 1)
-                    now = time.time()
                     
                     # PHASE 1: Wait for right lane to disappear STABLY for 2 full seconds
                     if phase == 1:
@@ -534,7 +600,7 @@ def control_loop(car: JetRacer):
                         else:
                             pid_state.pop("phase_debounce_time", None)
                             
-                    # PHASE 3: Wait for a brand new left lane to appear stably for 1 full second (LANE WIDTH CHECK REMOVED)
+                    # PHASE 3: Wait for a brand new left lane to appear stably for 1 full second
                     elif phase == 3:
                         if left_found:
                             if "phase_debounce_time" not in pid_state:
@@ -551,12 +617,9 @@ def control_loop(car: JetRacer):
                     
             # Set telemetry steering monitor value based on current operational mode
             if autonomy_state == "OVERTAKING": 
-                steer = 0.8
+                pass # Already handled inline dynamically
             elif autonomy_state == "RECOVERY": 
-                if (lidar_blocked or (0.0 < lidar_closest_left < 300.0)):
-                    pass 
-                else:
-                    steer = -0.8
+                pass # Already handled inline dynamically
         else:
             car.stop()
             autonomy_state = "FOLLOW"
