@@ -493,15 +493,15 @@ def control_loop(car: JetRacer):
                     else:
                         pid_state.pop("phase_debounce_time", None) 
                         
-                # PHASE 2: Wait for original right lane to cross center to become new left lane for 1 full second
+                # PHASE 2: Wait for original right lane to cross center to become new left lane (or new right lane to appear)
                 elif phase == 2:
-                    if left_found:
+                    if left_found or right_found:
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
                         elif now - pid_state["phase_debounce_time"] >= 0.5:
                             pid_state["crossing_phase"] = 3
                             pid_state.pop("phase_debounce_time", None)
-                            print("\n[STATE CHANGE] OVERTAKING Phase 2 -> 3 (CONFIRMED old right lane became new left)", flush=True)
+                            print("\n[STATE CHANGE] OVERTAKING Phase 2 -> 3 (CONFIRMED lane established)", flush=True)
                     else:
                         pid_state.pop("phase_debounce_time", None)
                         
@@ -588,15 +588,15 @@ def control_loop(car: JetRacer):
                         else:
                             pid_state.pop("phase_debounce_time", None)
                             
-                    # PHASE 2: Wait for left lane to cross center to become new right lane for 1 full second
+                    # PHASE 2: Wait for left lane to cross center to become new right lane (or new left lane to appear)
                     elif phase == 2:
-                        if right_found:
+                        if right_found or left_found:
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
                             elif now - pid_state["phase_debounce_time"] >= 0.5:
                                 pid_state["crossing_phase"] = 3
                                 pid_state.pop("phase_debounce_time", None)
-                                print("\n[STATE CHANGE] RECOVERY Phase 2 -> 3 (CONFIRMED old left lane became new right)", flush=True)
+                                print("\n[STATE CHANGE] RECOVERY Phase 2 -> 3 (CONFIRMED lane established)", flush=True)
                         else:
                             pid_state.pop("phase_debounce_time", None)
                             
