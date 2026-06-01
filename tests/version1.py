@@ -223,6 +223,8 @@ def process_frame(frame, s, annotate: bool):
     left_found = False
     right_found = False
     lane_width = 0.0
+    left_pixels = np.array([])   # ← add this
+    right_pixels = np.array([]) 
 
     # 7. PID
     if len(xs) > 50:
