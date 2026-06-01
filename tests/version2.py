@@ -223,6 +223,8 @@ def process_frame(frame, s, annotate: bool):
     left_found = False
     right_found = False
     lane_width = 0.0
+    left_x = 0.0
+    right_x = 0.0
 
     # 7. PID
     if len(xs) > 50:
@@ -304,7 +306,7 @@ def process_frame(frame, s, annotate: bool):
     else:
         annotated = frame
 
-    return annotated, error, steer, left_found, right_found, lane_width
+    return annotated, error, steer, left_found, right_found, lane_width, left_x, right_x
 
 
 # ── Async JPEG encode ─────────────────────────────────────────────────────────
@@ -386,7 +388,7 @@ def control_loop(car: JetRacer):
             has_clients = stream_clients > 0
 
         do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
-        annotated, error, steer, left_found, right_found, lane_width = process_frame(frame, s_copy, do_annotate)
+        annotated, error, steer, left_found, right_found, lane_width, left_x, right_x = process_frame(frame, s_copy, do_annotate)
         lane_found = left_found or right_found
 
         if do_annotate:
@@ -447,13 +449,11 @@ def control_loop(car: JetRacer):
                 lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
                 
                 # If we can see the right line, track relative to it!
-                if right_found and len(right_pixels) > 0:
+                if right_found:
                     # Target is exactly one lane width to the left of the right line
-                    right_x = np.mean(right_pixels) + x_start
                     dynamic_target_x = right_x - lw
-                elif left_found and len(left_pixels) > 0:
+                elif left_found:
                     # If we only see the left line, target is exactly one lane width to its left
-                    left_x = np.mean(left_pixels) + x_start
                     dynamic_target_x = left_x - lw
                 else:
                     # Blind fallback only if BOTH lines are totally lost mid-change
@@ -547,11 +547,9 @@ def control_loop(car: JetRacer):
                     lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
                     
                     # Track relative to lines to guide the car back safely
-                    if left_found and len(left_pixels) > 0:
-                        left_x = np.mean(left_pixels) + x_start
+                    if left_found:
                         dynamic_target_x = left_x + lw
-                    elif right_found and len(right_pixels) > 0:
-                        right_x = np.mean(right_pixels) + x_start
+                    elif right_found:
                         dynamic_target_x = right_x + lw
                     else:
                         dynamic_target_x = (WIDTH / 2.0) - lw
