@@ -278,7 +278,7 @@ def process_frame(frame, s, annotate: bool):
         steer = (s["kp"] * error
                + s["ki"] * pid_state["integral"]
                + s["kd"] * derivative)
-        steer = max(-1.0, min(1.0, steer))
+        steer = max(-0.75, min(0.75, steer))
         _last_steer = steer
     else:
         error = 0.0
@@ -434,7 +434,7 @@ def control_loop(car: JetRacer):
                     pid_state["last_time"] = now
                     
                     steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
-                    steer = max(-1.0, min(1.0, steer))
+                    steer = max(-0.75, min(0.75, steer))
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                 else:
@@ -472,8 +472,8 @@ def control_loop(car: JetRacer):
                 pid_state["last_time"] = now
                 
                 steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
-                steer = max(-1.0, min(1.0, steer))
-                
+                steer = max(-0.75, min(0.75, steer))
+
                 car.steer(steer)
                 car.forward(s_copy["speed"])
                 
@@ -567,8 +567,8 @@ def control_loop(car: JetRacer):
                     pid_state["last_time"] = now
                     
                     steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
-                    steer = max(-1.0, min(1.0, steer))
-                    
+                    steer = max(-0.75, min(0.75, steer))
+
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                     
