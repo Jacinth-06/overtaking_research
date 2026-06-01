@@ -495,7 +495,7 @@ def control_loop(car: JetRacer):
                         
                 # PHASE 2: Wait for original right lane to cross center to become new left lane (or new right lane to appear)
                 elif phase == 2:
-                    if left_found or right_found:
+                    if left_found:
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
                         elif now - pid_state["phase_debounce_time"] >= 0.5:
@@ -590,7 +590,7 @@ def control_loop(car: JetRacer):
                             
                     # PHASE 2: Wait for left lane to cross center to become new right lane (or new left lane to appear)
                     elif phase == 2:
-                        if right_found or left_found:
+                        if right_found:
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
                             elif now - pid_state["phase_debounce_time"] >= 0.5:
