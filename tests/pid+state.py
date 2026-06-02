@@ -22,8 +22,6 @@ import cv2
 import numpy as np
 import threading
 import time
-import serial
-import struct
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, Response, render_template_string, request, jsonify
 
@@ -73,9 +71,6 @@ state = {
     "enabled": False,
     # Lidar safety
     "stop_distance": 400.0,   # mm — stop if object closer than this
-    # IMU data
-    "imu_ax": 0, "imu_ay": 0, "imu_az": 0,
-    "imu_gx": 0, "imu_gy": 0, "imu_gz": 0,
     # Telemetry (read-only from browser)
     "error": 0.0, "steer": 0.0, "fps": 0,
     "lane_found": False,
@@ -370,39 +365,6 @@ def lidar_loop(car: JetRacer):
         time.sleep(0.10)   # ~10 Hz — fast enough for obstacle reaction
 
 
-_imu_cache = {"ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0}
-_imu_cache_lock = threading.Lock()
-
-def imu_loop():
-    """Background thread: poll IMU data from serial port."""
-    print("[imu] Background thread started")
-    try:
-        ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
-    except Exception as e:
-        print(f"[imu] Failed to open serial: {e}")
-        return
-
-    while True:
-        try:
-            if ser.read() == b'\x55':
-                data = ser.read(12)
-                if len(data) == 12:
-                    try:
-                        vals = struct.unpack('>hhhhhh', data)
-                        with _imu_cache_lock:
-                            _imu_cache["ax"] = vals[0]
-                            _imu_cache["ay"] = vals[1]
-                            _imu_cache["az"] = vals[2]
-                            _imu_cache["gx"] = vals[3]
-                            _imu_cache["gy"] = vals[4]
-                            _imu_cache["gz"] = vals[5]
-                    except struct.error:
-                        pass
-        except Exception as e:
-            print(f"[imu] error: {e}")
-            time.sleep(0.1)
-
-
 def control_loop(car: JetRacer):
     cap = open_camera()
     fps_counter, fps_time = 0, time.time()
@@ -443,14 +405,6 @@ def control_loop(car: JetRacer):
             lidar_closest = _lidar_cache["closest"]
             lidar_closest_left = _lidar_cache.get("closest_left", 0.0)
             lidar_blocked = _lidar_cache["blocked"]
-
-        with _imu_cache_lock:
-            imu_ax = _imu_cache["ax"]
-            imu_ay = _imu_cache["ay"]
-            imu_az = _imu_cache["az"]
-            imu_gx = _imu_cache["gx"]
-            imu_gy = _imu_cache["gy"]
-            imu_gz = _imu_cache["gz"]
 
         # Track state using our local copy baseline
         autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
@@ -679,12 +633,6 @@ def control_loop(car: JetRacer):
             state["lidar_closest_left"] = lidar_closest_left
             state["lidar_blocked"] = lidar_blocked
             state["autonomy_state"] = autonomy_state
-            state["imu_ax"] = imu_ax
-            state["imu_ay"] = imu_ay
-            state["imu_az"] = imu_az
-            state["imu_gx"] = imu_gx
-            state["imu_gy"] = imu_gy
-            state["imu_gz"] = imu_gz
 
         frame_idx += 1
 
@@ -771,10 +719,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <span class="stat-lbl">lidar front</span></div>
       <div class="stat"><span class="stat-val" id="v-lidar-left">0</span>
                         <span class="stat-lbl">lidar left</span></div>
-      <div class="stat"><span class="stat-val" id="v-imu-a">0,0,0</span>
-                        <span class="stat-lbl">accel</span></div>
-      <div class="stat"><span class="stat-val" id="v-imu-g">0,0,0</span>
-                        <span class="stat-lbl">gyro</span></div>
     </div>
     <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
@@ -914,11 +858,6 @@ async function poll() {
     const lidarLeftEl = document.getElementById("v-lidar-left");
     lidarLeftEl.textContent = d.lidar_closest_left.toFixed(0);
 
-    const imuAEl = document.getElementById("v-imu-a");
-    if(imuAEl) imuAEl.textContent = d.imu_ax + "," + d.imu_ay + "," + d.imu_az;
-    const imuGEl = document.getElementById("v-imu-g");
-    if(imuGEl) imuGEl.textContent = d.imu_gx + "," + d.imu_gy + "," + d.imu_gz;
-
     const pct = (d.error + 1) / 2 * 100;
     const bar = document.getElementById("error-bar");
     bar.style.left = pct + "%";
@@ -965,8 +904,7 @@ def status():
     with state_lock:
         return jsonify({k: state[k] for k in
                         ("fps", "error", "steer", "lane_found", "enabled",
-                         "lidar_closest", "lidar_closest_left", "lidar_blocked", "autonomy_state",
-                         "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz")})
+                         "lidar_closest", "lidar_closest_left", "lidar_blocked", "autonomy_state")})
 
 
 @app.route("/set", methods=["POST"])
@@ -990,9 +928,6 @@ if __name__ == "__main__":
     # Lidar runs in its own thread — never blocks the camera loop
     lt = threading.Thread(target=lidar_loop, args=(car,), daemon=True)
     lt.start()
-
-    it = threading.Thread(target=imu_loop, daemon=True)
-    it.start()
 
     t = threading.Thread(target=control_loop, args=(car,), daemon=True)
     t.start()
