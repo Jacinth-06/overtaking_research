@@ -460,7 +460,7 @@ def control_loop(car: JetRacer):
                     dynamic_target_x = (WIDTH / 2.0) + lw
 
                 # Calculate live error against where the lines actually are right now!
-                error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0) * 3.5
+                error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                 
                 dt = max(now - pid_state["last_time"], 0.001)
                 pid_state["integral"] += error * dt
@@ -588,7 +588,7 @@ def control_loop(car: JetRacer):
                         else:
                             pid_state.pop("phase_debounce_time", None)
                             
-                    # PHASE 2: Wait for left lane to cross center to become new right lane (or new left lane to appear)
+                    # PHASE 2: Wait for left lane to cross center to become new right lane 
                     elif phase == 2:
                         if right_found:
                             if "phase_debounce_time" not in pid_state:
