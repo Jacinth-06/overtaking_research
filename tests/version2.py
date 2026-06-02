@@ -481,12 +481,12 @@ def control_loop(car: JetRacer):
                 
                 phase = pid_state.get("crossing_phase", 1)
                 
-                # PHASE 1: Wait for original left lane to disappear STABLY for 2 full seconds
+                # PHASE 1: Wait for original left lane to disappear STABLY for 1 full seconds
                 if phase == 1:
                     if not left_found:
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 2.0:
+                        elif now - pid_state["phase_debounce_time"] >= 1.0:
                             pid_state["crossing_phase"] = 2
                             pid_state.pop("phase_debounce_time", None) 
                             print("\n[STATE CHANGE] OVERTAKING Phase 1 -> 2 (CONFIRMED lost old left lane)", flush=True)
@@ -505,7 +505,7 @@ def control_loop(car: JetRacer):
                     else:
                         pid_state.pop("phase_debounce_time", None)
                         
-                # PHASE 3: Wait for a brand new right lane to appear stably for 1 full second
+                # PHASE 3: Wait for a brand new right lane to appear stably for 0.5 second
                 elif phase == 3:
                     if right_found:
                         if "phase_debounce_time" not in pid_state:
@@ -576,12 +576,12 @@ def control_loop(car: JetRacer):
                     
                     phase = pid_state.get("crossing_phase", 1)
                     
-                    # PHASE 1: Wait for right lane to disappear STABLY for 2 full seconds
+                    # PHASE 1: Wait for right lane to disappear STABLY for 1 full seconds
                     if phase == 1:
                         if not right_found:
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
-                            elif now - pid_state["phase_debounce_time"] >= 2.0:
+                            elif now - pid_state["phase_debounce_time"] >= 1.0:
                                 pid_state["crossing_phase"] = 2
                                 pid_state.pop("phase_debounce_time", None)
                                 print("\n[STATE CHANGE] RECOVERY Phase 1 -> 2 (CONFIRMED lost old right lane)", flush=True)
@@ -600,7 +600,7 @@ def control_loop(car: JetRacer):
                         else:
                             pid_state.pop("phase_debounce_time", None)
                             
-                    # PHASE 3: Wait for a brand new left lane to appear stably for 1 full second
+                    # PHASE 3: Wait for a brand new left lane to appear stably for 0.5 second
                     elif phase == 3:
                         if left_found:
                             if "phase_debounce_time" not in pid_state:
