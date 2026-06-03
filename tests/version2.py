@@ -623,31 +623,28 @@ def control_loop(car: JetRacer):
             elif autonomy_state == "RECOVERY":
                 is_front_blocked = lidar_blocked
                 is_left_blocked = (lidar_closest_left > 0.0 and lidar_closest_left < 300.0)
+                
                 if is_front_blocked or is_left_blocked:
-                    car.steer(steer)
+                    # Fallback to the last known error-state steering safely cached in pid_state
+                    last_steer = pid_state.get("last_calculated_steer", 0.0)
+                    car.steer(last_steer)
                     car.forward(s_copy["speed"])
                 else:
                     # ── TRUE DYNAMIC RECOVERY STEER ──
-                    # Use the memory-cached lane width
                     lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
                     
                     # If we can see the left line, track relative to it!
                     if left_found:
-                        # Target is exactly one lane width to the left of the left line
                         dynamic_target_x = left_x - lw
                     elif right_found:
-                        # If we only see the right line, target is exactly one lane width to its left
                         dynamic_target_x = right_x - lw
                     else:
-                        # Blind fallback only if BOTH lines are totally lost mid-change
                         dynamic_target_x = (WIDTH / 2.0) - lw
 
-                    # Calculate live error against where the lines actually are right now!
                     error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                     
                     dt = max(now - pid_state["last_time"], 0.001)
                     pid_state["integral"] += error * dt
-                    # Prevent integral windup from ruining the next state
                     pid_state["integral"] = max(-2.0, min(2.0, pid_state["integral"]))
                     
                     derivative = (error - pid_state["last_error"]) / dt
@@ -656,15 +653,16 @@ def control_loop(car: JetRacer):
                     
                     steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
                     steer = max(-1, min(1, steer))
+                    
+                    # Cache this value so fallback conditions can access it safely
+                    pid_state["last_calculated_steer"] = steer
 
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                     
-                    # ... [Rest of your Phase 1, 2, 3 recovery logic remains exactly identical] ...
-                    
                     phase = pid_state.get("crossing_phase", 1)
                     
-                    # PHASE 1: Wait for right lane to disappear STABLY for 1 full seconds
+                    # PHASE 1: Wait for right lane to disappear STABLY for 1 full second
                     if phase == 1:
                         if not right_found:
                             if "phase_debounce_time" not in pid_state:
@@ -676,9 +674,13 @@ def control_loop(car: JetRacer):
                         else:
                             pid_state.pop("phase_debounce_time", None)
                             
-                    # PHASE 2: Wait for left lane to cross center to become new right lane 
+                    # PHASE 2: CRITICAL FIXED LOGIC
+                    # Moving Right -> Left means we wait for our old LEFT line to pass the center 
+                    # camera axis and cleanly stabilize as our new RIGHT lane boundary.
                     elif phase == 2:
-                        if right_found:
+                        # We must look for the stabilization of the 'right_found' after the physical cross,
+                        # but ensure its spatial coordinate right_x matches a right-hand position (> WIDTH/2)
+                        if right_found and (right_x > (WIDTH / 2.0)):
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
                             elif now - pid_state["phase_debounce_time"] >= 0.5:
