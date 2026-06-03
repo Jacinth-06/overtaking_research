@@ -390,12 +390,13 @@ def imu_loop():
                     try:
                         vals = struct.unpack('>hhhhhh', data)
                         with _imu_cache_lock:
-                            _imu_cache["ax"] = vals[0]
-                            _imu_cache["ay"] = vals[1]
-                            _imu_cache["az"] = vals[2]
-                            _imu_cache["gx"] = vals[3]
-                            _imu_cache["gy"] = vals[4]
-                            _imu_cache["gz"] = vals[5]
+                            # Scale values assuming standard +/- 2g and +/- 250 deg/s
+                            _imu_cache["ax"] = round(vals[0] / 16384.0, 2)
+                            _imu_cache["ay"] = round(vals[1] / 16384.0, 2)
+                            _imu_cache["az"] = round(vals[2] / 16384.0, 2)
+                            _imu_cache["gx"] = round(vals[3] / 131.0, 1)
+                            _imu_cache["gy"] = round(vals[4] / 131.0, 1)
+                            _imu_cache["gz"] = round(vals[5] / 131.0, 1)
                     except struct.error:
                         pass
         except Exception as e:
@@ -772,9 +773,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat"><span class="stat-val" id="v-lidar-left">0</span>
                         <span class="stat-lbl">lidar left</span></div>
       <div class="stat"><span class="stat-val" id="v-imu-a">0,0,0</span>
-                        <span class="stat-lbl">accel</span></div>
+                        <span class="stat-lbl">accel (g)</span></div>
       <div class="stat"><span class="stat-val" id="v-imu-g">0,0,0</span>
-                        <span class="stat-lbl">gyro</span></div>
+                        <span class="stat-lbl">gyro (&deg;/s)</span></div>
     </div>
     <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
