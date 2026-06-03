@@ -24,6 +24,8 @@ import threading
 import time
 import serial
 import struct
+import requests
+import queue
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, Response, render_template_string, request, jsonify
 
@@ -83,10 +85,15 @@ state = {
     "lidar_closest_left": 0.0, # closest left distance in mm
     "lidar_blocked": False,   # True when obstacle within stop_distance
     "autonomy_state": "FOLLOW",
+    "is_testing": False,
+    "test_id": "",
 }
 
 pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time(), "state_start_time": time.time()}
 state_lock = threading.Lock()
+
+FIREBASE_URL = "https://jetracer-f1b1c-default-rtdb.asia-southeast1.firebasedatabase.app"
+telemetry_queue = queue.Queue()
 
 _last_steer = 0.0
 
@@ -323,6 +330,34 @@ def _do_encode(img):
         global latest_frame
         latest_frame = jpeg.tobytes()
 
+
+# ── Firebase Telemetry ────────────────────────────────────────────────────────
+def firebase_loop():
+    print("[firebase] Telemetry background thread started")
+    batch = {}
+    last_upload_time = time.time()
+    
+    while True:
+        try:
+            test_id, timestamp, data_point = telemetry_queue.get(timeout=0.5)
+            if test_id not in batch:
+                batch[test_id] = {}
+            key = str(int(timestamp * 1000))
+            batch[test_id][key] = data_point
+        except queue.Empty:
+            pass
+            
+        now = time.time()
+        if now - last_upload_time >= 2.0:
+            if batch:
+                try:
+                    for tid, b_data in batch.items():
+                        url = f"{FIREBASE_URL}/test_runs/{tid}.json"
+                        requests.patch(url, json=b_data, timeout=5)
+                    batch.clear()
+                except Exception as e:
+                    print(f"[firebase] upload error: {e}")
+            last_upload_time = now
 
 # ── Lidar background thread ───────────────────────────────────────────────────
 # Runs independently at ~10 Hz; never blocks the camera / vision loop.
@@ -687,6 +722,40 @@ def control_loop(car: JetRacer):
             state["imu_gy"] = imu_gy
             state["imu_gz"] = imu_gz
 
+        # 5. Collect telemetry if testing is active
+        if s_copy.get("is_testing", False) and s_copy.get("test_id"):
+            current_time = time.time()
+            data_point = {
+                "timestamp": current_time,
+                "dt_loop": dt if 'dt' in locals() else 0.0,
+                "error": round(error, 4) if 'error' in locals() else 0.0,
+                "steer": round(steer, 4) if 'steer' in locals() else 0.0,
+                "left_found": left_found,
+                "right_found": right_found,
+                "lane_width": round(lane_width, 2) if 'lane_width' in locals() else 0.0,
+                "left_x": round(left_x, 2) if 'left_x' in locals() else 0.0,
+                "right_x": round(right_x, 2) if 'right_x' in locals() else 0.0,
+                "dynamic_target_x": round(dynamic_target_x, 2) if 'dynamic_target_x' in locals() else None,
+                "lidar_closest": lidar_closest,
+                "lidar_closest_left": lidar_closest_left,
+                "lidar_blocked": lidar_blocked,
+                "imu_ax": imu_ax, "imu_ay": imu_ay, "imu_az": imu_az,
+                "imu_gx": imu_gx, "imu_gy": imu_gy, "imu_gz": imu_gz,
+                "autonomy_state": autonomy_state,
+                "crossing_phase": pid_state.get("crossing_phase", 1),
+                "integral": round(pid_state.get("integral", 0.0), 4),
+                "derivative": round(derivative, 4) if 'derivative' in locals() else 0.0,
+                "nominal_lane_width": round(pid_state.get("nominal_lane_width", 0.0), 2)
+            }
+            # Include all settings from s_copy
+            for k, v in s_copy.items():
+                if k not in ["is_testing", "test_id"]:
+                    if isinstance(v, float):
+                        data_point[k] = round(v, 4)
+                    else:
+                        data_point[k] = v
+            telemetry_queue.put((s_copy["test_id"], current_time, data_point))
+
         frame_idx += 1
 
     cap.release()
@@ -776,6 +845,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <span class="stat-lbl">accel (g)</span></div>
       <div class="stat"><span class="stat-val" id="v-imu-g">0,0,0</span>
                         <span class="stat-lbl">gyro (&deg;/s)</span></div>
+      <div class="stat"><span class="stat-val" id="v-test">--</span>
+                        <span class="stat-lbl">test id</span></div>
     </div>
     <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
@@ -791,6 +862,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="btn-row">
       <button id="btn-go"   onclick="setEnabled(true)">&#9654; GO</button>
       <button id="btn-stop" onclick="setEnabled(false)">&#9632; STOP</button>
+      <button id="btn-test" onclick="toggleTest()" style="background: #6b7a99; color: #fff;">&#9654; START TEST</button>
     </div>
     <hr class="divider">
     <h2>PID gains</h2>
@@ -896,6 +968,20 @@ function setEnabled(v) {
   fetch("/set", {method:"POST", headers:{"Content-Type":"application/json"},
                  body: JSON.stringify({enabled: v})});
 }
+let isTesting = false;
+function toggleTest() {
+  isTesting = !isTesting;
+  const btn = document.getElementById("btn-test");
+  if(isTesting) {
+    btn.innerHTML = "&#9632; END TEST";
+    btn.style.background = "#ffb020";
+  } else {
+    btn.innerHTML = "&#9654; START TEST";
+    btn.style.background = "#6b7a99";
+  }
+  fetch("/set", {method:"POST", headers:{"Content-Type":"application/json"},
+                 body: JSON.stringify({is_testing: isTesting})});
+}
 async function poll() {
   try {
     const r = await fetch("/status");
@@ -919,6 +1005,20 @@ async function poll() {
     if(imuAEl) imuAEl.textContent = d.imu_ax + "," + d.imu_ay + "," + d.imu_az;
     const imuGEl = document.getElementById("v-imu-g");
     if(imuGEl) imuGEl.textContent = d.imu_gx + "," + d.imu_gy + "," + d.imu_gz;
+
+    const testEl = document.getElementById("v-test");
+    if(testEl) testEl.textContent = d.is_testing ? d.test_id : "--";
+    isTesting = d.is_testing;
+    const btn = document.getElementById("btn-test");
+    if(btn) {
+      if(isTesting) {
+        btn.innerHTML = "&#9632; END TEST";
+        btn.style.background = "#ffb020";
+      } else {
+        btn.innerHTML = "&#9654; START TEST";
+        btn.style.background = "#6b7a99";
+      }
+    }
 
     const pct = (d.error + 1) / 2 * 100;
     const bar = document.getElementById("error-bar");
@@ -967,7 +1067,7 @@ def status():
         return jsonify({k: state[k] for k in
                         ("fps", "error", "steer", "lane_found", "enabled",
                          "lidar_closest", "lidar_closest_left", "lidar_blocked", "autonomy_state",
-                         "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz")})
+                         "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz", "is_testing", "test_id")})
 
 
 @app.route("/set", methods=["POST"])
@@ -975,7 +1075,13 @@ def set_param():
     data = request.get_json(force=True)
     with state_lock:
         for k, v in data.items():
-            if k in state:
+            if k == "is_testing":
+                if v and not state.get("is_testing", False):
+                    state["test_id"] = f"test_{int(time.time())}"
+                    state["is_testing"] = True
+                elif not v and state.get("is_testing", False):
+                    state["is_testing"] = False
+            elif k in state:
                 state[k] = v
                 if k in ("kp", "ki", "kd"):
                     pid_state["integral"]   = 0.0
@@ -994,6 +1100,9 @@ if __name__ == "__main__":
 
     it = threading.Thread(target=imu_loop, daemon=True)
     it.start()
+
+    ft = threading.Thread(target=firebase_loop, daemon=True)
+    ft.start()
 
     t = threading.Thread(target=control_loop, args=(car,), daemon=True)
     t.start()
