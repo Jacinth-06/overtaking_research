@@ -606,22 +606,26 @@ def control_loop(car: JetRacer):
                         pid_state.pop("phase_debounce_time", None)
                     
             elif autonomy_state == "CHECKING":
+                # Maintain current lane tracking steering while waiting
                 car.steer(steer)
                 car.forward(s_copy["speed"])
-                # Wait until safe left distance (obstacle crossed)
-                phase = pid_state.get("crossing_phase", 1)
-                if phase == 1:
-                    # phase 1: detect obstacle on the left
-                    if lidar_closest_left > 0.0 and lidar_closest_left < 600.0:
-                        pid_state["crossing_phase"] = 2
-                        print(f"\n[STATE CHANGE] CHECKING -> Phase 2 (obstacle {lidar_closest_left}mm to left)", flush=True)
-                elif phase == 2:
-                    # phase 2: obstacle clears
-                    if lidar_closest_left == 0.0 or lidar_closest_left > 300.0:
+                
+                # Check if the left side is clear (no reading, or obstacle is far away)
+                is_left_side_clear = (lidar_closest_left == 0.0 or lidar_closest_left > 500.0)
+                
+                if is_left_side_clear:
+                    # Initialize debounce timer to ensure it's not a glitch
+                    if "phase_debounce_time" not in pid_state:
+                        pid_state["phase_debounce_time"] = now
+                    # If it remains clear for 0.2 seconds, safely switch to RECOVERY
+                    elif now - pid_state["phase_debounce_time"] >= 0.2:
                         autonomy_state = "RECOVERY"
-                        pid_state["crossing_phase"] = 1
+                        pid_state["crossing_phase"] = 1  # Reset phase for the next state
                         pid_state.pop("phase_debounce_time", None) 
-                        print("\n[STATE CHANGE] -> RECOVERY. Left side clear.", flush=True)
+                        print(f"\n[STATE CHANGE] -> RECOVERY. Left side clear ({lidar_closest_left}mm). Moving back.", flush=True)
+                else:
+                    # Obstacle is still there; reset timer
+                    pid_state.pop("phase_debounce_time", None)
                     
             elif autonomy_state == "RECOVERY":
                 is_front_blocked = lidar_blocked
