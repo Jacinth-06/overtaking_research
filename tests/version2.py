@@ -680,7 +680,7 @@ def control_loop(car: JetRacer):
                     elif phase == 2:
                         # We must look for the stabilization of the 'right_found' after the physical cross,
                         # but ensure its spatial coordinate right_x matches a right-hand position (> WIDTH/2)
-                        if right_found and (right_x > (WIDTH / 2.0)):
+                        if right_found :
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
                             elif now - pid_state["phase_debounce_time"] >= 0.5:
