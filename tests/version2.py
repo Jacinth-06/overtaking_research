@@ -507,6 +507,9 @@ def control_loop(car: JetRacer):
                     print(f"\n[STATE CHANGE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
                     
                     # ── DYNAMIC OVERTAKE INITIALIZATION ──
+                    # Save the initial lane width before the maneuver starts so we can use it later
+                    pid_state["initial_lane_width"] = pid_state.get("nominal_lane_width", 140.0)
+                    
                     lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
                     dynamic_target_x = (WIDTH / 2.0) + lw
                     error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0) * 3.5
@@ -631,7 +634,8 @@ def control_loop(car: JetRacer):
                     car.forward(s_copy["speed"])
                 else:
                     # ── TRUE DYNAMIC RECOVERY STEER ──
-                    lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
+                    # Use the initially calculated lane width from before the maneuver started
+                    lw = pid_state.get("initial_lane_width", 140.0)
                     
                     # If we can see the left line, track relative to it!
                     if left_found:
