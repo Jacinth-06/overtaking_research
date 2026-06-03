@@ -628,20 +628,26 @@ def control_loop(car: JetRacer):
                     car.forward(s_copy["speed"])
                 else:
                     # ── TRUE DYNAMIC RECOVERY STEER ──
+                    # Use the memory-cached lane width
                     lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
                     
-                    # Track relative to lines to guide the car back safely
+                    # If we can see the left line, track relative to it!
                     if left_found:
+                        # Target is exactly one lane width to the left of the left line
                         dynamic_target_x = left_x - lw
                     elif right_found:
+                        # If we only see the right line, target is exactly one lane width to its left
                         dynamic_target_x = right_x - lw
                     else:
+                        # Blind fallback only if BOTH lines are totally lost mid-change
                         dynamic_target_x = (WIDTH / 2.0) - lw
 
-                    error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0) * 3.5
+                    # Calculate live error against where the lines actually are right now!
+                    error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                     
                     dt = max(now - pid_state["last_time"], 0.001)
                     pid_state["integral"] += error * dt
+                    # Prevent integral windup from ruining the next state
                     pid_state["integral"] = max(-2.0, min(2.0, pid_state["integral"]))
                     
                     derivative = (error - pid_state["last_error"]) / dt
