@@ -530,72 +530,47 @@ def control_loop(car: JetRacer):
                     
             elif autonomy_state == "OVERTAKING":
                 # ── TRUE DYNAMIC STEER OVERTAKE ──
-                # Use the memory-cached lane width
                 lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
                 
-                # If we can see the right line, track relative to it!
                 if right_found:
-                    # Target is exactly one lane width to the right of the right line
                     dynamic_target_x = right_x + lw
                 elif left_found:
-                    # If we only see the left line, target is exactly one lane width to its right
                     dynamic_target_x = left_x + lw
                 else:
-                    # Blind fallback only if BOTH lines are totally lost mid-change
                     dynamic_target_x = (WIDTH / 2.0) + lw
 
-                # Calculate live error against where the lines actually are right now!
                 error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                 
                 dt = max(now - pid_state["last_time"], 0.001)
-                pid_state["integral"] += error * dt
-                # Prevent integral windup from ruining the next state
-                pid_state["integral"] = max(-2.0, min(2.0, pid_state["integral"])) 
-                
+                pid_state["integral"] = max(-2.0, min(2.0, pid_state["integral"] + error * dt)) 
                 derivative = (error - pid_state["last_error"]) / dt
                 pid_state["last_error"] = error
                 pid_state["last_time"] = now
                 
-                steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
-                steer = max(-1, min(1, steer))
-
+                steer = max(-1, min(1, s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative))
                 car.steer(steer)
                 car.forward(s_copy["speed"])
                 
-                # ... [Rest of your Phase 1, 2, 3 timer logic remains exactly identical] ...
-                
                 phase = pid_state.get("crossing_phase", 1)
                 
-                # PHASE 1: Wait for original left lane to disappear STABLY for 1 full seconds
+                # PHASE 1: Wait for the right lane line to cross over to the LEFT side of the camera
                 if phase == 1:
-                    if not left_found:
+                    if right_found and (right_x < (WIDTH / 2.0)):
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 1.0:
+                        elif now - pid_state["phase_debounce_time"] >= 0.3: # 0.3s stable cross
                             pid_state["crossing_phase"] = 2
                             pid_state.pop("phase_debounce_time", None) 
-                            print("\n[STATE CHANGE] OVERTAKING Phase 1 -> 2 (CONFIRMED lost old left lane)", flush=True)
+                            print("\n[STATE CHANGE] OVERTAKING Phase 1 -> 2 (Line physically crossed left)", flush=True)
                     else:
                         pid_state.pop("phase_debounce_time", None) 
                         
-                # PHASE 2: Wait for original right lane to cross center to become new left lane (or new right lane to appear)
+                # PHASE 2: Wait for a brand new right lane to appear on the right side
                 elif phase == 2:
-                    if left_found:
+                    if right_found and (right_x > (WIDTH / 2.0)):
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 0.5:
-                            pid_state["crossing_phase"] = 3
-                            pid_state.pop("phase_debounce_time", None)
-                            print("\n[STATE CHANGE] OVERTAKING Phase 2 -> 3 (CONFIRMED lane established)", flush=True)
-                    else:
-                        pid_state.pop("phase_debounce_time", None)
-                        
-                # PHASE 3: Wait for a brand new right lane to appear stably for 0.5 second
-                elif phase == 3:
-                    if right_found:
-                        if "phase_debounce_time" not in pid_state:
-                            pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 0.5:
+                        elif now - pid_state["phase_debounce_time"] >= 0.2: # 0.2s stable confirmation
                             autonomy_state = "CHECKING"
                             pid_state["crossing_phase"] = 1
                             pid_state.pop("phase_debounce_time", None)
@@ -632,16 +607,13 @@ def control_loop(car: JetRacer):
                 is_left_blocked = (lidar_closest_left > 0.0 and lidar_closest_left < 300.0)
                 
                 if is_front_blocked or is_left_blocked:
-                    # Fallback to the last known error-state steering safely cached in pid_state
                     last_steer = pid_state.get("last_calculated_steer", 0.0)
                     car.steer(last_steer)
                     car.forward(s_copy["speed"])
                 else:
                     # ── TRUE DYNAMIC RECOVERY STEER ──
-                    # Use the initially calculated lane width from before the maneuver started
                     lw = pid_state.get("initial_lane_width", 140.0)
                     
-                    # If we can see the left line, track relative to it!
                     if left_found:
                         dynamic_target_x = left_x - lw
                     elif right_found:
@@ -652,58 +624,36 @@ def control_loop(car: JetRacer):
                     error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                     
                     dt = max(now - pid_state["last_time"], 0.001)
-                    pid_state["integral"] += error * dt
-                    pid_state["integral"] = max(-2.0, min(2.0, pid_state["integral"]))
-                    
+                    pid_state["integral"] = max(-2.0, min(2.0, pid_state["integral"] + error * dt))
                     derivative = (error - pid_state["last_error"]) / dt
                     pid_state["last_error"] = error
                     pid_state["last_time"] = now
                     
-                    steer = (s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative)
-                    steer = max(-1, min(1, steer))
-                    
-                    # Cache this value so fallback conditions can access it safely
+                    steer = max(-1, min(1, s_copy["kp"] * error + s_copy["ki"] * pid_state["integral"] + s_copy["kd"] * derivative))
                     pid_state["last_calculated_steer"] = steer
-
                     car.steer(steer)
                     car.forward(s_copy["speed"])
                     
                     phase = pid_state.get("crossing_phase", 1)
                     
-                    # PHASE 1: Wait for right lane to disappear STABLY for 1 full second
+                    # PHASE 1: Wait for the left lane line to cross over to the RIGHT side of the camera
                     if phase == 1:
-                        if not right_found:
+                        if left_found and (left_x > (WIDTH / 2.0)):
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
-                            elif now - pid_state["phase_debounce_time"] >= 1.0:
+                            elif now - pid_state["phase_debounce_time"] >= 0.3:
                                 pid_state["crossing_phase"] = 2
                                 pid_state.pop("phase_debounce_time", None)
-                                print("\n[STATE CHANGE] RECOVERY Phase 1 -> 2 (CONFIRMED lost old right lane)", flush=True)
+                                print("\n[STATE CHANGE] RECOVERY Phase 1 -> 2 (Line physically crossed right)", flush=True)
                         else:
                             pid_state.pop("phase_debounce_time", None)
                             
-                    # PHASE 2: CRITICAL FIXED LOGIC
-                    # Moving Right -> Left means we wait for our old LEFT line to pass the center 
-                    # camera axis and cleanly stabilize as our new RIGHT lane boundary.
+                    # PHASE 2: Wait for a brand new left lane to appear on the left side
                     elif phase == 2:
-                        # We must look for the stabilization of the 'right_found' after the physical cross,
-                        # but ensure its spatial coordinate right_x matches a right-hand position (> WIDTH/2)
-                        if right_found :
+                        if left_found and (left_x < (WIDTH / 2.0)):
                             if "phase_debounce_time" not in pid_state:
                                 pid_state["phase_debounce_time"] = now
-                            elif now - pid_state["phase_debounce_time"] >= 0.5:
-                                pid_state["crossing_phase"] = 3
-                                pid_state.pop("phase_debounce_time", None)
-                                print("\n[STATE CHANGE] RECOVERY Phase 2 -> 3 (CONFIRMED lane established)", flush=True)
-                        else:
-                            pid_state.pop("phase_debounce_time", None)
-                            
-                    # PHASE 3: Wait for a brand new left lane to appear stably for 0.5 second
-                    elif phase == 3:
-                        if left_found:
-                            if "phase_debounce_time" not in pid_state:
-                                pid_state["phase_debounce_time"] = now
-                            elif now - pid_state["phase_debounce_time"] >= 0.5:
+                            elif now - pid_state["phase_debounce_time"] >= 0.2:
                                 autonomy_state = "FOLLOW"
                                 pid_state["crossing_phase"] = 1
                                 pid_state.pop("phase_debounce_time", None)
