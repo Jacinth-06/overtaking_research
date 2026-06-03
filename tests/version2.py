@@ -492,8 +492,10 @@ def control_loop(car: JetRacer):
         autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
         now = time.time()
 
-        # Keep a continuous track of the lane width baseline while driving normally
-        if left_found and right_found and lane_width > 50:
+        # FIX: Only update nominal_lane_width in FOLLOW state.
+        # During OVERTAKING/RECOVERY the live lane_width measures the center strip (~8px),
+        # which would corrupt the nominal baseline needed for the maneuver.
+        if autonomy_state == "FOLLOW" and left_found and right_found and lane_width > 50:
             old_lw = pid_state.get("nominal_lane_width", lane_width)
             pid_state["nominal_lane_width"] = 0.95 * old_lw + 0.05 * lane_width
 
@@ -529,16 +531,19 @@ def control_loop(car: JetRacer):
                     car.forward(s_copy["speed"])
                     
             elif autonomy_state == "OVERTAKING":
-                # ── TRUE DYNAMIC STEER OVERTAKE ──
-                lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
+                # Always use initial_lane_width — live lane_width is garbage during crossing
+                # (it measures the center strip width ~8px, not the true lane width).
+                lw = pid_state.get("initial_lane_width", 140.0)
                 
                 if right_found:
-                    # Target is the CENTER of the next lane (half a lane width beyond the right line)
-                    dynamic_target_x = right_x + lw * 0.5
+                    # Target = 0.75 lane-widths beyond the right reference line.
+                    # 0.5 was too weak — car stalled on center strip.
+                    # 1.0 goes off-screen. 0.75 commits through while staying in frame.
+                    dynamic_target_x = min(right_x + lw * 0.75, WIDTH - 15)
                 elif left_found:
-                    dynamic_target_x = left_x + lw * 0.5
+                    dynamic_target_x = min(left_x + lw * 0.75, WIDTH - 15)
                 else:
-                    dynamic_target_x = (WIDTH / 2.0) + lw * 0.5
+                    dynamic_target_x = min((WIDTH / 2.0) + lw * 0.75, WIDTH - 15)
 
                 error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                 
@@ -554,28 +559,32 @@ def control_loop(car: JetRacer):
                 
                 phase = pid_state.get("crossing_phase", 1)
                 
-                # PHASE 1: Wait for the right lane line to cross over to the LEFT side of the camera
+                # PHASE 1: Center separator has crossed firmly to the LEFT side of camera.
+                # After the car moves right, the separator (previously right_x) becomes
+                # the leftmost line. We track it via left_x.
+                # Threshold < 40% of WIDTH = separator is firmly on left side.
                 if phase == 1:
-                    if right_found and (right_x < (WIDTH / 2.0)):
+                    if left_found and (left_x < WIDTH * 0.40):
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 0.3: # 0.3s stable cross
+                        elif now - pid_state["phase_debounce_time"] >= 0.3:
                             pid_state["crossing_phase"] = 2
-                            pid_state.pop("phase_debounce_time", None) 
-                            print("\n[STATE CHANGE] OVERTAKING Phase 1 -> 2 (Line physically crossed left)", flush=True)
+                            pid_state.pop("phase_debounce_time", None)
+                            print("\n[STATE CHANGE] OVERTAKING Phase 1 -> 2 (separator on left side confirmed)", flush=True)
                     else:
-                        pid_state.pop("phase_debounce_time", None) 
+                        pid_state.pop("phase_debounce_time", None)
                         
-                # PHASE 2: Wait for a brand new right lane to appear on the right side
+                # PHASE 2: Right boundary is now stably visible on the right side (> 60% of frame).
+                # This confirms the car is centred in the right lane.
                 elif phase == 2:
-                    if right_found and (right_x > (WIDTH / 2.0)):
+                    if right_found and (right_x > WIDTH * 0.60):
                         if "phase_debounce_time" not in pid_state:
                             pid_state["phase_debounce_time"] = now
-                        elif now - pid_state["phase_debounce_time"] >= 0.2: # 0.2s stable confirmation
+                        elif now - pid_state["phase_debounce_time"] >= 0.2:
                             autonomy_state = "CHECKING"
                             pid_state["crossing_phase"] = 1
                             pid_state.pop("phase_debounce_time", None)
-                            print("\n[STATE CHANGE] -> CHECKING. Switched to right lane safely.", flush=True)
+                            print("\n[STATE CHANGE] -> CHECKING. Right lane confirmed stable.", flush=True)
                             pid_state["integral"] = 0.0
                             pid_state["last_error"] = 0.0
                     else:
