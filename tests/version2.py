@@ -511,8 +511,8 @@ def control_loop(car: JetRacer):
                     pid_state["initial_lane_width"] = pid_state.get("nominal_lane_width", 140.0)
                     
                     lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
-                    dynamic_target_x = (WIDTH / 2.0) + lw
-                    error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0) * 3.5
+                    dynamic_target_x = (WIDTH / 2.0) + lw * 0.5
+                    error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                     
                     dt = max(now - pid_state["last_time"], 0.001)
                     pid_state["integral"] += error * dt
@@ -533,11 +533,12 @@ def control_loop(car: JetRacer):
                 lw = lane_width if lane_width > 50 else pid_state.get("nominal_lane_width", 140.0)
                 
                 if right_found:
-                    dynamic_target_x = right_x + lw
+                    # Target is the CENTER of the next lane (half a lane width beyond the right line)
+                    dynamic_target_x = right_x + lw * 0.5
                 elif left_found:
-                    dynamic_target_x = left_x + lw
+                    dynamic_target_x = left_x + lw * 0.5
                 else:
-                    dynamic_target_x = (WIDTH / 2.0) + lw
+                    dynamic_target_x = (WIDTH / 2.0) + lw * 0.5
 
                 error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                 
@@ -615,11 +616,12 @@ def control_loop(car: JetRacer):
                     lw = pid_state.get("initial_lane_width", 140.0)
                     
                     if left_found:
-                        dynamic_target_x = left_x - lw
+                        # Target is the CENTER of the original lane (half a lane width beyond the left line)
+                        dynamic_target_x = left_x - lw * 0.5
                     elif right_found:
-                        dynamic_target_x = right_x - lw
+                        dynamic_target_x = right_x - lw * 0.5
                     else:
-                        dynamic_target_x = (WIDTH / 2.0) - lw
+                        dynamic_target_x = (WIDTH / 2.0) - lw * 0.5
 
                     error = (dynamic_target_x - WIDTH / 2.0) / (WIDTH / 2.0)
                     
