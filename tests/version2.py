@@ -453,7 +453,16 @@ def encoder_loop():
         print(f"[encoder] Failed to open serial: {e}")
         return
 
-    DISTANCE_PER_TICK = 0.01  # m/tick (Needs to be calibrated for actual robot)
+    # Physical properties based on 37-520 Motor
+    WHEEL_DIAMETER_M = 0.065   # Adjust to your exact wheel diameter (default 65mm)
+    GEAR_RATIO = 30.0          # 1:30 reduction rate
+    MOTOR_PPR = 11.0           # Standard hall encoder pulses per motor rev
+    ENCODER_MULT = 4.0         # 4 for standard quadrature reading (A/B rising+falling)
+    
+    PULSES_PER_OUT_REV = MOTOR_PPR * GEAR_RATIO * ENCODER_MULT
+    WHEEL_CIRCUMFERENCE = 3.14159 * WHEEL_DIAMETER_M
+    DISTANCE_PER_TICK = WHEEL_CIRCUMFERENCE / PULSES_PER_OUT_REV
+
     last_left = None
     last_right = None
     last_time = time.time()
