@@ -416,7 +416,7 @@ _encoder_cache = {"speed": 0.0, "distance": 0.0}
 _encoder_cache_lock = threading.Lock()
 
 def sensor_loop():
-    """Background thread: reads combined IMU+Encoder packet — no type byte."""
+    """Background thread: IMU (bytes 0-11) + Encoder counter (bytes 18-19)."""
     print("[sensors] Background thread started")
     try:
         ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
@@ -424,64 +424,31 @@ def sensor_loop():
         print(f"[sensors] Failed to open serial: {e}")
         return
 
-    # Physical encoder constants
-    WHEEL_DIAMETER_M     = 0.065
-    GEAR_RATIO           = 30.0
-    MOTOR_PPR            = 11.0
-    ENCODER_MULT         = 4.0
-    PULSES_PER_OUT_REV   = MOTOR_PPR * GEAR_RATIO * ENCODER_MULT
-    WHEEL_CIRCUMFERENCE  = 3.14159 * WHEEL_DIAMETER_M
-    DISTANCE_PER_TICK    = WHEEL_CIRCUMFERENCE / PULSES_PER_OUT_REV
+    PACKET_SIZE = 26  # read enough to reach byte 19
 
-    last_left    = None
-    last_right   = None
-    last_time    = time.time()
+    WHEEL_DIAMETER_M    = 0.065
+    GEAR_RATIO          = 30.0
+    MOTOR_PPR           = 11.0
+    ENCODER_MULT        = 4.0
+    PULSES_PER_REV      = MOTOR_PPR * GEAR_RATIO * ENCODER_MULT
+    WHEEL_CIRCUMFERENCE = 3.14159 * WHEEL_DIAMETER_M
+    DISTANCE_PER_TICK   = WHEEL_CIRCUMFERENCE / PULSES_PER_REV
+
+    last_count     = None
+    last_time      = time.time()
     total_distance = 0.0
-
-    # Combined packet: 6×int16 IMU (12 bytes) + 2×int32 encoder (8 bytes) = 20 bytes
-    PACKET_SIZE = 20
 
     while True:
         try:
-            if ser.read() == b'\x55':
+            if ser.read(1) == b'\x55':
                 data = ser.read(PACKET_SIZE)
                 if len(data) == PACKET_SIZE:
                     try:
-                        # First 12 bytes = IMU (ax, ay, az, gx, gy, gz)
-                        imu_vals = struct.unpack('>hhhhhh', data[0:12])
+                        # ── IMU: bytes 0–11, big-endian int16 ──────────────
+                        ax, ay, az, gx, gy, gz = struct.unpack('>hhhhhh', data[0:12])
                         with _imu_cache_lock:
-                            _imu_cache["ax"] = round(imu_vals[0] / 16384.0, 2)
-                            _imu_cache["ay"] = round(imu_vals[1] / 16384.0, 2)
-                            _imu_cache["az"] = round(imu_vals[2] / 16384.0, 2)
-                            _imu_cache["gx"] = round(imu_vals[3] / 131.0, 1)
-                            _imu_cache["gy"] = round(imu_vals[4] / 131.0, 1)
-                            _imu_cache["gz"] = round(imu_vals[5] / 131.0, 1)
-
-                        # Last 8 bytes = encoder (left, right)
-                        left, right = struct.unpack('>ii', data[12:20])
-                        now = time.time()
-                        dt = now - last_time
-
-                        if dt > 0 and last_left is not None and last_right is not None:
-                            d_left  = left  - last_left
-                            d_right = right - last_right
-                            d_dist  = (d_left + d_right) / 2.0 * DISTANCE_PER_TICK
-                            speed   = d_dist / dt
-                            total_distance += d_dist
-                            with _encoder_cache_lock:
-                                _encoder_cache["speed"]    = round(speed, 2)
-                                _encoder_cache["distance"] = round(total_distance, 2)
-
-                        last_left  = left
-                        last_right = right
-                        last_time  = now
-
-                    except struct.error as e:
-                        print(f"[sensors] unpack error: {e}")
-
-        except Exception as e:
-            print(f"[sensors] error: {e}")
-            time.sleep(0.1)
+                            _imu_cache["ax"] = round(ax / 16384.0, 2)
+                            _imu_cache["ay"] = round(ay / 16384.0, 2)
 
 def control_loop(car: JetRacer):
     cap = open_camera()
