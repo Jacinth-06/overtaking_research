@@ -449,6 +449,42 @@ def sensor_loop():
                         with _imu_cache_lock:
                             _imu_cache["ax"] = round(ax / 16384.0, 2)
                             _imu_cache["ay"] = round(ay / 16384.0, 2)
+                            _imu_cache["az"] = round(az / 16384.0, 2)
+                            _imu_cache["gx"] = round(gx / 131.0, 1)
+                            _imu_cache["gy"] = round(gy / 131.0, 1)
+                            _imu_cache["gz"] = round(gz / 131.0, 1)
+
+                        # ── Encoder: bytes 18–19, big-endian uint16 ────────
+                        count = struct.unpack('>H', data[18:20])[0]
+
+                        now = time.time()
+                        dt  = now - last_time
+
+                        if last_count is not None and dt > 0:
+                            # Handle uint16 wraparound (0xFFFF → 0x0000)
+                            d_count = count - last_count
+                            if d_count > 32767:    # wrapped backwards
+                                d_count -= 65536
+                            elif d_count < -32767:  # wrapped forwards
+                                d_count += 65536
+
+                            d_dist = d_count * DISTANCE_PER_TICK
+                            speed  = d_dist / dt
+                            total_distance += d_dist
+
+                            with _encoder_cache_lock:
+                                _encoder_cache["speed"]    = round(speed, 3)
+                                _encoder_cache["distance"] = round(total_distance, 3)
+
+                        last_count = count
+                        last_time  = now
+
+                    except struct.error as e:
+                        print(f"[sensors] unpack error: {e}")
+
+        except Exception as e:
+            print(f"[sensors] read error: {e}")
+            time.sleep(0.1)
 
 def control_loop(car: JetRacer):
     cap = open_camera()
