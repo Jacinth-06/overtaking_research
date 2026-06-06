@@ -416,7 +416,11 @@ _encoder_cache = {"speed": 0.0, "distance": 0.0}
 _encoder_cache_lock = threading.Lock()
 
 def sensor_loop():
-    """Background thread: IMU (bytes 0-11) + Encoder counter (bytes 18-19)."""
+    """
+    Background thread: parses the Waveshare RP2040 protocol correctly.
+    Full packet: AA 55 2D 01 [39 data bytes] [checksum]
+    Total = 45 bytes including both headers.
+    """
     print("[sensors] Background thread started")
     try:
         ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
@@ -424,68 +428,100 @@ def sensor_loop():
         print(f"[sensors] Failed to open serial: {e}")
         return
 
-    PACKET_SIZE = 26  # read enough to reach byte 19
+    HEAD1 = 0xAA
+    HEAD2 = 0x55
 
-    WHEEL_DIAMETER_M    = 0.065
-    GEAR_RATIO          = 30.0
-    MOTOR_PPR           = 11.0
-    ENCODER_MULT        = 4.0
-    PULSES_PER_REV      = MOTOR_PPR * GEAR_RATIO * ENCODER_MULT
-    WHEEL_CIRCUMFERENCE = 3.14159 * WHEEL_DIAMETER_M
-    DISTANCE_PER_TICK   = WHEEL_CIRCUMFERENCE / PULSES_PER_REV
-
-    last_count     = None
-    last_time      = time.time()
     total_distance = 0.0
+    last_lvel      = 0
+    last_rvel      = 0
+    last_time      = time.time()
+
+    # Wheel constants for speed→m/s conversion
+    # lvel/rvel are raw encoder RPM counts from RP2040 PID
+    # The RP2040 sends motor velocity in encoder ticks/s (empirically ~1000 = 1 m/s)
+    # We'll log raw first and calibrate
+    SPEED_SCALE = 0.001   # adjust after seeing raw values
 
     while True:
         try:
-            if ser.read(1) == b'\x55':
-                data = ser.read(PACKET_SIZE)
-                if len(data) == PACKET_SIZE:
-                    try:
-                        # ── IMU: bytes 0–11, big-endian int16 ──────────────
-                        ax, ay, az, gx, gy, gz = struct.unpack('>hhhhhh', data[0:12])
-                        with _imu_cache_lock:
-                            _imu_cache["ax"] = round(ax / 16384.0, 2)
-                            _imu_cache["ay"] = round(ay / 16384.0, 2)
-                            _imu_cache["az"] = round(az / 16384.0, 2)
-                            _imu_cache["gx"] = round(gx / 131.0, 1)
-                            _imu_cache["gy"] = round(gy / 131.0, 1)
-                            _imu_cache["gz"] = round(gz / 131.0, 1)
+            # Wait for 0xAA
+            b = ser.read(1)
+            if not b or b[0] != HEAD1:
+                continue
 
-                        # ── Encoder: bytes 18–19, big-endian uint16 ────────
-                        count = struct.unpack('>H', data[18:20])[0]
+            # Wait for 0x55
+            b = ser.read(1)
+            if not b or b[0] != HEAD2:
+                continue
 
-                        now = time.time()
-                        dt  = now - last_time
+            # Read size byte
+            b = ser.read(1)
+            if not b:
+                continue
+            frame_size = b[0]   # should be 0x2D = 45
 
-                        if last_count is not None and dt > 0:
-                            # Handle uint16 wraparound (0xFFFF → 0x0000)
-                            d_count = count - last_count
-                            if d_count > 32767:    # wrapped backwards
-                                d_count -= 65536
-                            elif d_count < -32767:  # wrapped forwards
-                                d_count += 65536
+            if frame_size < 5 or frame_size > 50:
+                continue        # garbage — resync
 
-                            d_dist = d_count * DISTANCE_PER_TICK
-                            speed  = d_dist / dt
-                            total_distance += d_dist
+            # Read remaining bytes (frame_size - 3 already read)
+            remaining = frame_size - 3
+            rest = ser.read(remaining)
+            if len(rest) != remaining:
+                continue
 
-                            with _encoder_cache_lock:
-                                _encoder_cache["speed"]    = round(speed, 3)
-                                _encoder_cache["distance"] = round(total_distance, 3)
+            # Full frame: [0xAA, 0x55, size, ...rest]
+            frame = bytes([HEAD1, HEAD2, frame_size]) + rest
 
-                        last_count = count
-                        last_time  = now
+            # Verify checksum (sum of all bytes except last)
+            calc_sum = sum(frame[:-1]) & 0xFF
+            recv_sum = frame[-1]
+            if calc_sum != recv_sum:
+                continue
 
-                    except struct.error as e:
-                        print(f"[sensors] unpack error: {e}")
+            # ── Parse IMU ────────────────────────────────────────────────────
+            # Gyro (data[4:10]) — in packet index: frame[4:10]
+            gx = int.from_bytes(frame[4:6],   'big', signed=True) / 32768 * 2000
+            gy = int.from_bytes(frame[6:8],   'big', signed=True) / 32768 * 2000
+            gz = int.from_bytes(frame[8:10],  'big', signed=True) / 32768 * 2000
+            # Accel (data[10:16])
+            ax = int.from_bytes(frame[10:12], 'big', signed=True) / 32768 * 2 * 9.8
+            ay = int.from_bytes(frame[12:14], 'big', signed=True) / 32768 * 2 * 9.8
+            az = int.from_bytes(frame[14:16], 'big', signed=True) / 32768 * 2 * 9.8
+
+            with _imu_cache_lock:
+                _imu_cache["ax"] = round(ax, 2)
+                _imu_cache["ay"] = round(ay, 2)
+                _imu_cache["az"] = round(az, 2)
+                _imu_cache["gx"] = round(gx, 1)
+                _imu_cache["gy"] = round(gy, 1)
+                _imu_cache["gz"] = round(gz, 1)
+
+            # ── Parse Encoder ─────────────────────────────────────────────────
+            # data[34:36] = left actual speed, data[36:38] = right actual speed
+            # frame offset = 3 (headers+size) + 31 = frame[34], frame[36]
+            lvel = int.from_bytes(frame[34:36], 'big', signed=True)
+            rvel = int.from_bytes(frame[36:38], 'big', signed=True)
+
+            now = time.time()
+            dt  = now - last_time
+
+            if dt > 0:
+                avg_vel   = (lvel + rvel) / 2.0
+                speed_ms  = avg_vel * SPEED_SCALE
+                d_dist    = speed_ms * dt
+                total_distance += d_dist
+
+                with _encoder_cache_lock:
+                    _encoder_cache["speed"]    = round(speed_ms, 3)
+                    _encoder_cache["distance"] = round(total_distance, 3)
+
+            last_lvel = lvel
+            last_rvel = rvel
+            last_time = now
 
         except Exception as e:
-            print(f"[sensors] read error: {e}")
+            print(f"[sensors] error: {e}")
             time.sleep(0.1)
-
 def control_loop(car: JetRacer):
     cap = open_camera()
     fps_counter, fps_time = 0, time.time()
