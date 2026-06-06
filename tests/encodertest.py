@@ -1,37 +1,32 @@
 import serial
 import struct
-import time
 
-ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
-print("Watching for both IMU and encoder packets...\n")
+ser = serial.Serial('/dev/ttyACM0', 115200, timeout=2)
+print("Spin the wheels NOW. Watching for ANY value that changes with wheel movement...\n")
+
+prev_bytes = None
+count = 0
 
 while True:
     try:
         if ser.read(1) == b'\x55':
-            # Try 12 bytes (IMU)
-            data = ser.read(12)
+            # Read 30 bytes to catch any packet size
+            data = ser.read(30)
+            hex_str = data.hex()
             
-            # Check if it looks like encoder (8 bytes meaningful, last 4 zeros)
-            # by trying both interpretations
-            
-            # Try as encoder (first 8 bytes)
-            if len(data) >= 8:
-                left, right = struct.unpack('>ii', data[0:8])
-                ax, ay, az, gx, gy, gz = struct.unpack('>hhhhhh', data[0:12])
+            # Show bytes 8-16 specifically (where encoder would be if after IMU)
+            if len(data) >= 16:
+                # Try little-endian too (RP2040 is little-endian natively)
+                l_le, r_le = struct.unpack('<ii', data[0:8])
+                l_le2, r_le2 = struct.unpack('<ii', data[8:16])
                 
-                # Encoder values should be small integers that grow slowly
-                # IMU values should be small after dividing by 16384/131
-                enc_plausible = abs(left) < 500000 and abs(right) < 500000
-                imu_plausible = abs(ax/16384.0) < 3 and abs(gz/131.0) < 500
-                
-                print(f"RAW 12 bytes: {data.hex()}")
-                print(f"  As encoder: left={left}, right={right}  {'← ENCODER?' if enc_plausible else ''}")
-                print(f"  As IMU:     ax={ax/16384:.2f}g, gz={gz/131:.1f}°/s  {'← IMU?' if imu_plausible else ''}")
+                print(f"[{count:04d}] full hex: {hex_str}")
+                print(f"  bytes[0:8]  little-endian int32 pair: {l_le}, {r_le}")
+                print(f"  bytes[8:16] little-endian int32 pair: {l_le2}, {r_le2}")
                 print()
+                count += 1
                 
     except KeyboardInterrupt:
         break
-    except Exception as e:
-        print(f"err: {e}")
 
 ser.close()
