@@ -1,34 +1,24 @@
 import serial
 import struct
-import time
 
 ser = serial.Serial('/dev/ttyACM0', 115200, timeout=2)
-print("Listening for 0x55 start byte... (Ctrl+C to stop)\n")
+print("Packet structure analysis...\n")
 
-count = 0
-while True:
-    try:
-        byte = ser.read(1)
-        if byte == b'\x55':
-            # Read next 30 bytes after start byte — enough to see full packet
-            rest = ser.read(30)
-            hex_str = ' '.join(f'{b:02X}' for b in rest)
-            print(f"[{count:04d}] 55 | {hex_str}")
-            count += 1
+packets = []
+while len(packets) < 20:
+    if ser.read(1) == b'\x55':
+        data = ser.read(30)
+        if len(data) == 30:
+            packets.append(data)
 
-            # Try interpreting bytes at different offsets as int32 pairs
-            for offset in range(0, min(len(rest)-7, 20)):
-                try:
-                    l, r = struct.unpack('>ii', rest[offset:offset+8])
-                    if abs(l) < 1_000_000 and abs(r) < 1_000_000:
-                        print(f"        offset[{offset}]: left={l}, right={r}  ← plausible encoder values?")
-                except:
-                    pass
+# Show which bytes actually change across packets (those carry real data)
+print("Byte | Values seen across 20 packets")
+print("-----|" + "-"*60)
+for i in range(30):
+    vals = [p[i] for p in packets]
+    unique = set(vals)
+    changes = len(unique) > 1
+    marker = " ← LIVE DATA" if changes else "   (static)"
+    print(f"  {i:02d} | {vals[:8]}  {marker}")
 
-    except KeyboardInterrupt:
-        print("\nDone.")
-        ser.close()
-        break
-    except Exception as e:
-        print(f"Error: {e}")
-        time.sleep(0.1)
+ser.close()
