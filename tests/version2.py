@@ -414,7 +414,8 @@ def imu_loop():
     """Background thread: poll IMU data from serial port."""
     print("[imu] Background thread started")
     try:
-        ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
+        # Changed to ttyACM1 since encoder is on ttyACM0
+        ser = serial.Serial('/dev/ttyACM1', 115200, timeout=1)
     except Exception as e:
         print(f"[imu] Failed to open serial: {e}")
         return
@@ -447,8 +448,8 @@ def encoder_loop():
     """Background thread: poll Encoder data from serial port."""
     print("[encoder] Background thread started")
     try:
-        # Using ttyACM1. Change to your specific encoder port if different.
-        ser = serial.Serial('/dev/ttyACM1', 115200, timeout=1)
+        # User specified encoder is on ttyACM0
+        ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
     except Exception as e:
         print(f"[encoder] Failed to open serial: {e}")
         return
