@@ -412,55 +412,27 @@ def lidar_loop(car: JetRacer):
 _imu_cache = {"ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0}
 _imu_cache_lock = threading.Lock()
 
-def imu_loop():
-    """Background thread: poll IMU data from serial port."""
-    print("[imu] Background thread started")
-    try:
-        # Changed to ttyACM1 since encoder is on ttyACM0
-        ser = serial.Serial('/dev/ttyACM1', 115200, timeout=1)
-    except Exception as e:
-        print(f"[imu] Failed to open serial: {e}")
-        return
-
-    while True:
-        try:
-            if ser.read() == b'\x55':
-                data = ser.read(12)
-                if len(data) == 12:
-                    try:
-                        vals = struct.unpack('>hhhhhh', data)
-                        with _imu_cache_lock:
-                            # Scale values assuming standard +/- 2g and +/- 250 deg/s
-                            _imu_cache["ax"] = round(vals[0] / 16384.0, 2)
-                            _imu_cache["ay"] = round(vals[1] / 16384.0, 2)
-                            _imu_cache["az"] = round(vals[2] / 16384.0, 2)
-                            _imu_cache["gx"] = round(vals[3] / 131.0, 1)
-                            _imu_cache["gy"] = round(vals[4] / 131.0, 1)
-                            _imu_cache["gz"] = round(vals[5] / 131.0, 1)
-                    except struct.error:
-                        pass
-        except Exception as e:
-            print(f"[imu] error: {e}")
-            time.sleep(0.1)
-
 _encoder_cache = {"speed": 0.0, "distance": 0.0}
 _encoder_cache_lock = threading.Lock()
 
-def encoder_loop():
-    """Background thread: poll Encoder data from serial port."""
-    print("[encoder] Background thread started")
+def sensor_loop():
+    """Background thread: poll IMU and Encoder data from a single serial port."""
+    print("[sensors] Background thread started")
     try:
-        # User specified encoder is on ttyACM0
         ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
     except Exception as e:
-        print(f"[encoder] Failed to open serial: {e}")
+        print(f"[sensors] Failed to open serial: {e}")
         return
 
-    # Physical properties based on 37-520 Motor
-    WHEEL_DIAMETER_M = 0.065   # Adjust to your exact wheel diameter (default 65mm)
-    GEAR_RATIO = 30.0          # 1:30 reduction rate
-    MOTOR_PPR = 11.0           # Standard hall encoder pulses per motor rev
-    ENCODER_MULT = 4.0         # 4 for standard quadrature reading (A/B rising+falling)
+    # Packet type constants
+    PACKET_IMU     = 0x01
+    PACKET_ENCODER = 0x02
+
+    # Physical properties for encoder
+    WHEEL_DIAMETER_M = 0.065   
+    GEAR_RATIO = 30.0          
+    MOTOR_PPR = 11.0           
+    ENCODER_MULT = 4.0         
     
     PULSES_PER_OUT_REV = MOTOR_PPR * GEAR_RATIO * ENCODER_MULT
     WHEEL_CIRCUMFERENCE = 3.14159 * WHEEL_DIAMETER_M
@@ -474,31 +446,49 @@ def encoder_loop():
     while True:
         try:
             if ser.read() == b'\x55':
-                data = ser.read(8)
-                if len(data) == 8:
-                    try:
-                        left, right = struct.unpack('>ii', data)
-                        now = time.time()
-                        dt = now - last_time
-                        if dt > 0:
-                            if last_left is not None and last_right is not None:
-                                d_left = left - last_left
-                                d_right = right - last_right
-                                d_dist = (d_left + d_right) / 2.0 * DISTANCE_PER_TICK
-                                speed = d_dist / dt
-                                total_distance += d_dist
-                                
-                                with _encoder_cache_lock:
-                                    _encoder_cache["speed"] = round(speed, 2)
-                                    _encoder_cache["distance"] = round(total_distance, 2)
+                pkt_type = ser.read(1)
+                
+                if pkt_type == bytes([PACKET_IMU]):
+                    data = ser.read(12)
+                    if len(data) == 12:
+                        try:
+                            vals = struct.unpack('>hhhhhh', data)
+                            with _imu_cache_lock:
+                                _imu_cache["ax"] = round(vals[0] / 16384.0, 2)
+                                _imu_cache["ay"] = round(vals[1] / 16384.0, 2)
+                                _imu_cache["az"] = round(vals[2] / 16384.0, 2)
+                                _imu_cache["gx"] = round(vals[3] / 131.0, 1)
+                                _imu_cache["gy"] = round(vals[4] / 131.0, 1)
+                                _imu_cache["gz"] = round(vals[5] / 131.0, 1)
+                        except struct.error:
+                            pass
+                            
+                elif pkt_type == bytes([PACKET_ENCODER]):
+                    data = ser.read(8)
+                    if len(data) == 8:
+                        try:
+                            left, right = struct.unpack('>ii', data)
+                            now = time.time()
+                            dt = now - last_time
+                            if dt > 0:
+                                if last_left is not None and last_right is not None:
+                                    d_left = left - last_left
+                                    d_right = right - last_right
+                                    d_dist = (d_left + d_right) / 2.0 * DISTANCE_PER_TICK
+                                    speed = d_dist / dt
+                                    total_distance += d_dist
                                     
-                            last_left = left
-                            last_right = right
-                            last_time = now
-                    except struct.error:
-                        pass
+                                    with _encoder_cache_lock:
+                                        _encoder_cache["speed"] = round(speed, 2)
+                                        _encoder_cache["distance"] = round(total_distance, 2)
+                                        
+                                last_left = left
+                                last_right = right
+                                last_time = now
+                        except struct.error:
+                            pass
         except Exception as e:
-            print(f"[encoder] error: {e}")
+            print(f"[sensors] error: {e}")
             time.sleep(0.1)
 
 def control_loop(car: JetRacer):
@@ -1107,11 +1097,8 @@ if __name__ == "__main__":
     ft = threading.Thread(target=firebase_loop, daemon=True)
     ft.start()
 
-    it = threading.Thread(target=imu_loop, daemon=True)
-    it.start()
-
-    et = threading.Thread(target=encoder_loop, daemon=True)
-    et.start()
+    st = threading.Thread(target=sensor_loop, daemon=True)
+    st.start()
 
     t = threading.Thread(target=control_loop, args=(car,), daemon=True)
     t.start()
