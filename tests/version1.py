@@ -78,6 +78,8 @@ state = {
     # IMU data
     "imu_ax": 0, "imu_ay": 0, "imu_az": 0,
     "imu_gx": 0, "imu_gy": 0, "imu_gz": 0,
+    # Encoder data
+    "enc_speed": 0.0, "enc_dist": 0.0,
     # Telemetry (read-only from browser)
     "error": 0.0, "steer": 0.0, "fps": 0,
     "lane_found": False,
@@ -440,6 +442,55 @@ def imu_loop():
             print(f"[imu] error: {e}")
             time.sleep(0.1)
 
+_encoder_cache = {"speed": 0.0, "distance": 0.0}
+_encoder_cache_lock = threading.Lock()
+
+def encoder_loop():
+    """Background thread: poll Encoder data from serial port."""
+    print("[encoder] Background thread started")
+    try:
+        # Using ttyACM1. Change to your specific encoder port if different.
+        ser = serial.Serial('/dev/ttyACM1', 115200, timeout=1)
+    except Exception as e:
+        print(f"[encoder] Failed to open serial: {e}")
+        return
+
+    DISTANCE_PER_TICK = 0.01  # m/tick (Needs to be calibrated for actual robot)
+    last_left = None
+    last_right = None
+    last_time = time.time()
+    total_distance = 0.0
+
+    while True:
+        try:
+            if ser.read() == b'\x55':
+                data = ser.read(8)
+                if len(data) == 8:
+                    try:
+                        left, right = struct.unpack('>ii', data)
+                        now = time.time()
+                        dt = now - last_time
+                        if dt > 0:
+                            if last_left is not None and last_right is not None:
+                                d_left = left - last_left
+                                d_right = right - last_right
+                                d_dist = (d_left + d_right) / 2.0 * DISTANCE_PER_TICK
+                                speed = d_dist / dt
+                                total_distance += d_dist
+                                
+                                with _encoder_cache_lock:
+                                    _encoder_cache["speed"] = round(speed, 2)
+                                    _encoder_cache["distance"] = round(total_distance, 2)
+                                    
+                            last_left = left
+                            last_right = right
+                            last_time = now
+                    except struct.error:
+                        pass
+        except Exception as e:
+            print(f"[encoder] error: {e}")
+            time.sleep(0.1)
+
 def control_loop(car: JetRacer):
     cap = open_camera()
     fps_counter, fps_time = 0, time.time()
@@ -488,6 +539,10 @@ def control_loop(car: JetRacer):
             imu_gx = _imu_cache["gx"]
             imu_gy = _imu_cache["gy"]
             imu_gz = _imu_cache["gz"]
+
+        with _encoder_cache_lock:
+            enc_speed = _encoder_cache["speed"]
+            enc_dist = _encoder_cache["distance"]
 
         # Track state using our local copy baseline
         autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
@@ -661,6 +716,8 @@ def control_loop(car: JetRacer):
             state["imu_gx"] = imu_gx
             state["imu_gy"] = imu_gy
             state["imu_gz"] = imu_gz
+            state["enc_speed"] = enc_speed
+            state["enc_dist"] = enc_dist
 
 
         # 5. Collect telemetry if testing is active
@@ -678,6 +735,7 @@ def control_loop(car: JetRacer):
                 "lidar_blocked": lidar_blocked,
                 "imu_ax": imu_ax, "imu_ay": imu_ay, "imu_az": imu_az,
                 "imu_gx": imu_gx, "imu_gy": imu_gy, "imu_gz": imu_gz,
+                "enc_speed": enc_speed, "enc_dist": enc_dist,
                 "autonomy_state": autonomy_state,
                 "crossing_phase": pid_state.get("crossing_phase", 1),
                 "integral": round(pid_state.get("integral", 0.0), 4),
@@ -784,6 +842,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <span class="stat-lbl">imu g</span></div>
       <div class="stat"><span class="stat-val" id="v-test">--</span>
                         <span class="stat-lbl">test id</span></div>
+      <div class="stat"><span class="stat-val" id="v-enc-spd">0.00</span>
+                        <span class="stat-lbl">enc spd</span></div>
+      <div class="stat"><span class="stat-val" id="v-enc-dist">0.00</span>
+                        <span class="stat-lbl">enc dist</span></div>
     </div>
     <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
@@ -936,6 +998,11 @@ async function poll() {
     const imuGEl = document.getElementById("v-imu-g");
     if(imuGEl) imuGEl.textContent = d.imu_gx + "," + d.imu_gy + "," + d.imu_gz;
 
+    const encSpdEl = document.getElementById("v-enc-spd");
+    if(encSpdEl) encSpdEl.textContent = d.enc_speed.toFixed(2) + " m/s";
+    const encDistEl = document.getElementById("v-enc-dist");
+    if(encDistEl) encDistEl.textContent = d.enc_dist.toFixed(2) + " m";
+
     const testEl = document.getElementById("v-test");
     if(testEl) testEl.textContent = d.is_testing ? d.test_id : "--";
     isTesting = d.is_testing;
@@ -996,7 +1063,7 @@ def status():
     with state_lock:
         return jsonify({k: state[k] for k in
                         ("fps", "error", "steer", "lane_found", "enabled",
-                         "lidar_closest", "lidar_closest_left", "lidar_blocked", "autonomy_state", "is_testing", "test_id", "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz")})
+                         "lidar_closest", "lidar_closest_left", "lidar_blocked", "autonomy_state", "is_testing", "test_id", "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz", "enc_speed", "enc_dist")})
 
 
 @app.route("/set", methods=["POST"])
@@ -1032,6 +1099,9 @@ if __name__ == "__main__":
 
     it = threading.Thread(target=imu_loop, daemon=True)
     it.start()
+
+    et = threading.Thread(target=encoder_loop, daemon=True)
+    et.start()
 
     t = threading.Thread(target=control_loop, args=(car,), daemon=True)
     t.start()
