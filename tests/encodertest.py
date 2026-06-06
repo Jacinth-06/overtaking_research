@@ -1,71 +1,70 @@
-import serial
-import struct
+import smbus2
 import time
+import threading
 from jetracer import JetRacer
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 car = JetRacer(init_lidar=False)
 car.arm(delay=2)
 
-ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
-print("Starting in 2 seconds — will drive forward for 3s, then stop.\n")
-print(f"{'Phase':<12} {'BE[18:20]':>10} {'LE[18:20]':>10} {'BE[17:19]':>10} {'BE[19:21]':>10} {'delta':>7}  hex")
-print("-" * 80)
+bus  = smbus2.SMBus(1)
+ADDR = 0x60
 
-time.sleep(2)
+# ── Snapshot registers at rest ────────────────────────────────────────────────
+def read_all_regs():
+    snapshot = {}
+    for reg in range(0x00, 0x40):
+        try:
+            data = bus.read_i2c_block_data(ADDR, reg, 4)
+            snapshot[reg] = data
+        except Exception:
+            pass
+    return snapshot
 
-# ── Phase control ─────────────────────────────────────────────────────────────
-start      = time.time()
-phase      = "STATIONARY1"
-drove      = False
-stopped    = False
+print("Reading registers at REST...")
+rest = read_all_regs()
+time.sleep(0.5)
 
-last_count   = None
-packet_count = 0
+# ── Drive forward 3 seconds ───────────────────────────────────────────────────
+print("Driving forward 3s...")
+car.forward(0.25)
+time.sleep(3)
+car.stop()
+print("Stopped.\n")
+time.sleep(0.3)
 
-while True:
-    try:
-        now = time.time() - start
+# ── Snapshot registers after driving ─────────────────────────────────────────
+print("Reading registers AFTER DRIVE...")
+after = read_all_regs()
 
-        # Phase transitions
-        if now >= 3.0 and phase == "STATIONARY1":
-            phase = "DRIVING"
-            car.forward(0.25)
-            print("\n>>> DRIVING FORWARD <<<\n")
+# ── Compare: show only registers that CHANGED ─────────────────────────────────
+print(f"\n{'Reg':>5}  {'REST bytes':>12}  {'AFTER bytes':>12}  "
+      f"{'REST i32':>12}  {'AFTER i32':>12}  {'DELTA':>10}")
+print("-" * 75)
 
-        if now >= 6.0 and phase == "DRIVING":
-            phase = "STATIONARY2"
-            car.stop()
-            print("\n>>> STOPPED <<<\n")
+changed = False
+for reg in sorted(rest.keys()):
+    if reg not in after:
+        continue
+    r = rest[reg]
+    a = after[reg]
+    if r != a:
+        r_i32 = int.from_bytes(r, 'big', signed=True)
+        a_i32 = int.from_bytes(a, 'big', signed=True)
+        delta  = a_i32 - r_i32
+        print(f"  {reg:#04x}  {r.hex():>12}  {a.hex():>12}  "
+              f"{r_i32:>12}  {a_i32:>12}  {delta:>+10}")
+        changed = True
 
-        if now >= 9.0:
-            print("\nDone.")
-            car.stop()
-            ser.close()
-            break
+if not changed:
+    print("  No registers changed — encoder not exposed via I2C at 0x60")
+    print("\n  Printing ALL readable registers for reference:")
+    print(f"\n  {'Reg':>5}  {'Bytes':>12}  {'i16 BE':>10}  {'i32 BE':>12}")
+    print("  " + "-" * 50)
+    for reg, data in sorted(rest.items()):
+        i16 = int.from_bytes(data[0:2], 'big', signed=True)
+        i32 = int.from_bytes(data[0:4], 'big', signed=True)
+        print(f"    {reg:#04x}  {data.hex():>12}  {i16:>10}  {i32:>12}")
 
-        # ── Read serial ───────────────────────────────────────────────────────
-        if ser.read(1) == b'\x55':
-            data = ser.read(26)
-            if len(data) == 26:
-                b18_19_be = struct.unpack('>H', data[18:20])[0]
-                b18_19_le = struct.unpack('<H', data[18:20])[0]
-                b17_18_be = struct.unpack('>H', data[17:19])[0]
-                b19_20_be = struct.unpack('>H', data[19:21])[0]
-
-                delta = b18_19_be - last_count if last_count is not None else 0
-                last_count = b18_19_be
-
-                packet_count += 1
-                if packet_count % 10 == 0:
-                    print(f"{phase:<12} {b18_19_be:>10}  {b18_19_le:>10}  "
-                          f"{b17_18_be:>10}  {b19_20_be:>10}  {delta:>+7}  "
-                          f"{data[17:21].hex()}")
-
-    except KeyboardInterrupt:
-        car.stop()
-        ser.close()
-        print("\nInterrupted.")
-        break
-    except Exception as e:
-        print(f"err: {e}")
+bus.close()
+car.stop()
