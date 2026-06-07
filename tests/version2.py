@@ -386,7 +386,11 @@ _encoder_cache = {"speed": 0.0, "distance": 0.0}
 _encoder_cache_lock = threading.Lock()
 
 def sensor_loop():
-    """Background thread: poll IMU and Encoder data from a single serial port."""
+    """
+    Background thread: parses the Waveshare RP2040 protocol correctly.
+    Full packet: AA 55 2D 01 [39 data bytes] [checksum]
+    Total = 45 bytes including both headers.
+    """
     print("[sensors] Background thread started")
     try:
         ser = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
@@ -394,95 +398,99 @@ def sensor_loop():
         print(f"[sensors] Failed to open serial: {e}")
         return
 
-    # Packet type constants
-    PACKET_IMU     = 0x01
-    PACKET_ENCODER = 0x02
+    HEAD1 = 0xAA
+    HEAD2 = 0x55
 
-    # Physical properties for encoder
-    WHEEL_DIAMETER_M = 0.065   
-    GEAR_RATIO = 30.0          
-    MOTOR_PPR = 11.0           
-    ENCODER_MULT = 4.0         
-    
-    PULSES_PER_OUT_REV = MOTOR_PPR * GEAR_RATIO * ENCODER_MULT
-    WHEEL_CIRCUMFERENCE = 3.14159 * WHEEL_DIAMETER_M
-    DISTANCE_PER_TICK = WHEEL_CIRCUMFERENCE / PULSES_PER_OUT_REV
-
-    last_left = None
-    last_right = None
-    last_time = time.time()
     total_distance = 0.0
+    last_lvel      = 0
+    last_rvel      = 0
+    last_time      = time.time()
+
+    # Wheel constants for speed→m/s conversion
+    # lvel/rvel are raw encoder RPM counts from RP2040 PID
+    # The RP2040 sends motor velocity in encoder ticks/s (empirically ~1000 = 1 m/s)
+    # We'll log raw first and calibrate
+    SPEED_SCALE = 0.00748   # Calibrated: 1.12m actual / 10.8m reported   # adjust after seeing raw values
 
     while True:
         try:
-            if ser.read() == b'\x55':
-                pkt_type = ser.read(1)
-                
-                if pkt_type == bytes([PACKET_IMU]):
-                    data = ser.read(12)
-                    if len(data) == 12:
-                        try:
-                            vals = struct.unpack('>hhhhhh', data)
-                            with _imu_cache_lock:
-                                _imu_cache["ax"] = round(vals[0] / 16384.0, 2)
-                                _imu_cache["ay"] = round(vals[1] / 16384.0, 2)
-                                _imu_cache["az"] = round(vals[2] / 16384.0, 2)
-                                _imu_cache["gx"] = round(vals[3] / 131.0, 1)
-                                _imu_cache["gy"] = round(vals[4] / 131.0, 1)
-                                _imu_cache["gz"] = round(vals[5] / 131.0, 1)
-                        except struct.error:
-                            pass
-                            
-                elif pkt_type == bytes([PACKET_ENCODER]):
-                    data = ser.read(8)
-                    if len(data) == 8:
-                        try:
-                            left, right = struct.unpack('>ii', data)
-                            now = time.time()
-                            dt = now - last_time
-                            if dt > 0:
-                                if last_left is not None and last_right is not None:
-                                    d_left = left - last_left
-                                    d_right = right - last_right
-                                    d_dist = (d_left + d_right) / 2.0 * DISTANCE_PER_TICK
-                                    speed = d_dist / dt
-                                    total_distance += d_dist
-                                    
-                                    with _encoder_cache_lock:
-                                        _encoder_cache["speed"] = round(speed, 2)
-                                        _encoder_cache["distance"] = round(total_distance, 2)
-                                        
-                                last_left = left
-                                last_right = right
-                                last_time = now
-                        except struct.error:
-                            pass
+            # Wait for 0xAA
+            b = ser.read(1)
+            if not b or b[0] != HEAD1:
+                continue
+
+            # Wait for 0x55
+            b = ser.read(1)
+            if not b or b[0] != HEAD2:
+                continue
+
+            # Read size byte
+            b = ser.read(1)
+            if not b:
+                continue
+            frame_size = b[0]   # should be 0x2D = 45
+
+            if frame_size < 5 or frame_size > 50:
+                continue        # garbage — resync
+
+            # Read remaining bytes (frame_size - 3 already read)
+            remaining = frame_size - 3
+            rest = ser.read(remaining)
+            if len(rest) != remaining:
+                continue
+
+            # Full frame: [0xAA, 0x55, size, ...rest]
+            frame = bytes([HEAD1, HEAD2, frame_size]) + rest
+
+            # Verify checksum (sum of all bytes except last)
+            calc_sum = sum(frame[:-1]) & 0xFF
+            recv_sum = frame[-1]
+            if calc_sum != recv_sum:
+                continue
+
+            # ── Parse IMU ────────────────────────────────────────────────────
+            # Gyro (data[4:10]) — in packet index: frame[4:10]
+            gx = int.from_bytes(frame[4:6],   'big', signed=True) / 32768 * 2000
+            gy = int.from_bytes(frame[6:8],   'big', signed=True) / 32768 * 2000
+            gz = int.from_bytes(frame[8:10],  'big', signed=True) / 32768 * 2000
+            # Accel (data[10:16])
+            ax = int.from_bytes(frame[10:12], 'big', signed=True) / 32768 * 2 * 9.8
+            ay = int.from_bytes(frame[12:14], 'big', signed=True) / 32768 * 2 * 9.8
+            az = int.from_bytes(frame[14:16], 'big', signed=True) / 32768 * 2 * 9.8
+
+            with _imu_cache_lock:
+                _imu_cache["ax"] = round(ax, 2)
+                _imu_cache["ay"] = round(ay, 2)
+                _imu_cache["az"] = round(az, 2)
+                _imu_cache["gx"] = round(gx, 1)
+                _imu_cache["gy"] = round(gy, 1)
+                _imu_cache["gz"] = round(gz, 1)
+
+            # ── Parse Encoder ─────────────────────────────────────────────────
+            # data[34:36] = left actual speed, data[36:38] = right actual speed
+            # frame offset = 3 (headers+size) + 31 = frame[34], frame[36]
+            lvel = int.from_bytes(frame[34:36], 'big', signed=True)
+            rvel = int.from_bytes(frame[36:38], 'big', signed=True)
+
+            now = time.time()
+            dt  = now - last_time
+
+            if dt > 0:
+                avg_vel   = (lvel + rvel) / 2.0
+                speed_ms  = avg_vel * SPEED_SCALE
+                d_dist    = speed_ms * dt
+                total_distance += d_dist
+
+                with _encoder_cache_lock:
+                    _encoder_cache["speed"]    = round(speed_ms, 3)
+                    _encoder_cache["distance"] = round(total_distance, 3)
+
+            last_lvel = lvel
+            last_rvel = rvel
+            last_time = now
+
         except Exception as e:
             print(f"[sensors] error: {e}")
-            time.sleep(0.1)) == 8:
-                    try:
-                        left, right = struct.unpack('>ii', data)
-                        now = time.time()
-                        dt = now - last_time
-                        if dt > 0:
-                            if last_left is not None and last_right is not None:
-                                d_left = left - last_left
-                                d_right = right - last_right
-                                d_dist = (d_left + d_right) / 2.0 * DISTANCE_PER_TICK
-                                speed = d_dist / dt
-                                total_distance += d_dist
-                                
-                                with _encoder_cache_lock:
-                                    _encoder_cache["speed"] = round(speed, 2)
-                                    _encoder_cache["distance"] = round(total_distance, 2)
-                                    
-                            last_left = left
-                            last_right = right
-                            last_time = now
-                    except struct.error:
-                        pass
-        except Exception as e:
-            print(f"[encoder] error: {e}")
             time.sleep(0.1)
 
 
