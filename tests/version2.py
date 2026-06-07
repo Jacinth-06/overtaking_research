@@ -379,7 +379,36 @@ def lidar_loop(car: JetRacer):
     while True:
         try:
             with state_lock:
-                STOP_DISTANCE = _imu_cache = {"ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0}
+                STOP_DISTANCE = state["stop_distance"]
+
+            # Use enough samples to get good coverage for both front and left
+            scan = car.lidar_scan(samples=150)
+            
+            front_distances = [dist for ang, dist in scan.items() if (ang >= 320 or ang <= 40) and dist > 10]
+            left_distances = [dist for ang, dist in scan.items() if (250 <= ang <= 310) and dist > 10]
+            
+            closest_front = min(front_distances) if front_distances else 0.0
+            closest_left = min(left_distances) if left_distances else 0.0
+            
+            is_blocked = closest_front > 0 and closest_front < STOP_DISTANCE
+            
+            with _lidar_cache_lock:
+                _lidar_cache["closest"] = round(closest_front, 1)
+                _lidar_cache["closest_left"] = round(closest_left, 1)
+                _lidar_cache["blocked"] = is_blocked
+                
+        except Exception as e:
+            print(f"[lidar] scan error: {e}")
+            with _lidar_cache_lock:
+                _lidar_cache["closest"] = 0.0
+                _lidar_cache["closest_left"] = 0.0
+                _lidar_cache["blocked"] = True
+
+        time.sleep(0.10)   # ~10 Hz — fast enough for obstacle reaction
+
+
+
+_imu_cache = {"ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0}
 _imu_cache_lock = threading.Lock()
 
 _encoder_cache = {"speed": 0.0, "distance": 0.0}
