@@ -89,6 +89,7 @@ state = {
     "autonomy_state": "FOLLOW",
     "is_testing": False,
     "test_id": "",
+    "reset_encoder_dist": False,
 }
 
 pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time(), "state_start_time": time.time()}
@@ -443,6 +444,11 @@ def sensor_loop():
     SPEED_SCALE = 0.00748   # Calibrated: 1.12m actual / 10.8m reported   # adjust after seeing raw values
 
     while True:
+        with state_lock:
+            if state.get("reset_encoder_dist"):
+                total_distance = 0.0
+                state["reset_encoder_dist"] = False
+
         try:
             # Wait for 0xAA
             b = ser.read(1)
@@ -1109,6 +1115,8 @@ def set_param():
                 elif not v and state.get("is_testing", False):
                     state["is_testing"] = False
             elif k in state:
+                if k == "enabled" and state["enabled"] and not v:
+                    state["reset_encoder_dist"] = True
                 state[k] = v
                 if k in ("kp", "ki", "kd"):
                     pid_state["integral"]   = 0.0
