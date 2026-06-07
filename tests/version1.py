@@ -440,7 +440,7 @@ def sensor_loop():
     # lvel/rvel are raw encoder RPM counts from RP2040 PID
     # The RP2040 sends motor velocity in encoder ticks/s (empirically ~1000 = 1 m/s)
     # We'll log raw first and calibrate
-    SPEED_SCALE = 0.07047   # adjust after seeing raw values
+    SPEED_SCALE = 0.007308   # Calibrated: 1.12m actual / 10.8m reported   # adjust after seeing raw values
 
     while True:
         try:
