@@ -7,18 +7,31 @@ Tracks vehicle position (x, y, yaw, speed) at all times using:
 - Dead Reckoning kinematic updates
 
 Reads from Waveshare RP2040 board over /dev/ttyACM0.
+Includes keyboard WASD drive control thread for manual operation.
 """
 
+import os
 import sys
 import time
 import math
+import select
+import termios
+import tty
 import serial
+import threading
 from dataclasses import dataclass
 
+# Add parent directory to path so we can import local jetracer package
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from jetracer import JetRacer
+
 # SPEED_SCALE maps raw RP2040 encoder readings to m/s.
-# Empirically calibrated: 1.12m actual distance / 10.8m raw reported (0.1037 multiplier on average)
-# Here we reuse the scale from version2.py (0.00748).
 SPEED_SCALE = 0.00748
+
+# Global control flags for keyboard thread communication
+stop_keyboard = False
+current_throttle = 0.0
+current_steer = 0.0
 
 @dataclass
 class State:
@@ -110,8 +123,89 @@ def calibrate_gyro(ser, duration=2.0):
     return bias
 
 
+def keyboard_control_thread(car, old_settings):
+    """
+    Background thread that reads keyboard presses and updates car actuators.
+    Controls:
+      W: Forward (0.15 throttle)
+      S: Reverse (-0.15 throttle)
+      A: Steer Left (-0.60 steering)
+      D: Steer Right (0.60 steering)
+      Space / X: Stop throttle and center steering
+      Q: Quit application cleanly
+    """
+    global stop_keyboard, current_throttle, current_steer
+    
+    print("\n" + "="*50)
+    print("Keyboard Drive Controls Active:")
+    print("  W: Forward | S: Reverse")
+    print("  A: Left    | D: Right")
+    print("  Space / X: Stop & Center")
+    print("  Q: Quit")
+    print("="*50 + "\n")
+
+    try:
+        while not stop_keyboard:
+            # Configure stdin to raw non-blocking character reading
+            tty.setraw(sys.stdin.fileno())
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
+            
+            if rlist:
+                key = sys.stdin.read(1)
+                
+                # Temporarily restore standard terminal settings to prevent print corruption
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                
+                k = key.lower()
+                if k == 'q':
+                    print("\n[drive] Shutting down application...")
+                    stop_keyboard = True
+                    break
+                elif k == 'w':
+                    current_throttle = 0.15
+                    car.throttle(current_throttle)
+                elif k == 's':
+                    current_throttle = -0.15
+                    car.throttle(current_throttle)
+                elif k == 'a':
+                    current_steer = -0.6
+                    car.steer(current_steer)
+                elif k == 'd':
+                    current_steer = 0.6
+                    car.steer(current_steer)
+                elif key == ' ' or k == 'x':
+                    current_throttle = 0.0
+                    current_steer = 0.0
+                    car.stop()
+            else:
+                # Keep terminal settings standard while idle to allow prints
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                
+    except Exception as e:
+        print(f"\n[drive] Keyboard thread error: {e}")
+    finally:
+        # Final safety restore of terminal settings
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+
 def main():
-    # Attempt to open the serial port
+    global stop_keyboard, current_throttle, current_steer
+
+    # Save original terminal settings for restoration later
+    old_terminal_settings = termios.tcgetattr(sys.stdin)
+
+    # 1. Initialize JetRacer (PCA9685/Servo/Motor)
+    # We do not initialize Lidar for Phase 1 to keep startup fast and independent
+    print("[init] Initializing JetRacer motor controller...")
+    try:
+        car = JetRacer(init_lidar=False)
+        car.arm(delay=2)
+    except Exception as e:
+        print(f"\n[error] Failed to initialize JetRacer motor board: {e}")
+        print("Please verify connection to PCA9685 I2C interface.")
+        sys.exit(1)
+
+    # 2. Attempt to open the serial port for RP2040 communication
     serial_port = '/dev/ttyACM0'
     baud_rate = 115200
     print(f"[init] Connecting to serial port: {serial_port} at {baud_rate} baud...")
@@ -120,10 +214,19 @@ def main():
     except Exception as e:
         print(f"\n[error] Failed to open serial port {serial_port}: {e}")
         print("Please check if the rover is connected and `/dev/ttyACM0` exists.")
+        car.stop()
         sys.exit(1)
 
-    # 1. Perform gyro calibration
+    # 3. Perform gyro calibration
     gz_bias = calibrate_gyro(ser, duration=2.0)
+
+    # 4. Start the background keyboard control thread
+    kb_thread = threading.Thread(
+        target=keyboard_control_thread,
+        args=(car, old_terminal_settings),
+        daemon=True
+    )
+    kb_thread.start()
 
     # Initialize state variables
     state = State(x=0.0, y=0.0, yaw=0.0, speed=0.0)
@@ -133,14 +236,11 @@ def main():
     fps_time = time.time()
     freq = 0.0
 
-    print("\n" + "="*50)
-    print("State Estimation Active (Phase 1)")
-    print("Push the rover forward/backward and turn to verify.")
-    print("Press Ctrl+C to stop.")
+    print("\nState Estimation Active (Phase 1)")
     print("="*50 + "\n")
 
     try:
-        while True:
+        while not stop_keyboard:
             parsed = parse_telemetry_packet(ser)
             if parsed is None:
                 continue
@@ -152,7 +252,7 @@ def main():
 
             gz_deg, lvel, rvel = parsed
 
-            # Measure frequency
+            # Measure loop frequency
             packet_count += 1
             if now - fps_time >= 1.0:
                 freq = packet_count / (now - fps_time)
@@ -182,25 +282,26 @@ def main():
             state.y += state.speed * math.sin(state.yaw) * dt
 
             # ── 4. Live Terminal Display ──
-            # Format outputs:
-            # - x, y in meters
-            # - yaw in degrees for easy verification
-            # - speed in meters/second
-            # - loop frequency in Hz
             yaw_deg = math.degrees(state.yaw)
             print(
                 f"\rState -> X: {state.x:6.3f} m | Y: {state.y:6.3f} m | "
                 f"Yaw: {yaw_deg:6.1f}° | Speed: {state.speed:5.3f} m/s | "
-                f"Freq: {freq:4.1f} Hz",
+                f"Freq: {freq:4.1f} Hz | "
+                f"Drive -> T: {current_throttle:+.2f}, S: {current_steer:+.2f}",
                 end="",
                 flush=True
             )
 
     except KeyboardInterrupt:
-        print("\n\n[exit] Exiting state estimation.")
+        print("\n\n[exit] KeyboardInterrupt detected.")
     finally:
+        # Stop car motors safely
+        car.stop()
+        # Close serial port
         ser.close()
-        print("[exit] Serial port closed.")
+        # Ensure terminal settings are restored to default
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_terminal_settings)
+        print("[exit] Cleared motor commands, closed serial port, and restored terminal settings.")
 
 
 if __name__ == '__main__':
