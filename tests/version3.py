@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-version3.py — Phase 1: Build State Estimation (Automated Drive Verification)
+version3.py — Phase 1: Build State Estimation (Automated Drive Verification + Lidar Trigger)
 Tracks vehicle position (x, y, yaw, speed) at all times using:
 - Wheel Encoders (for speed and distance travelled)
 - IMU Gyro Z (for heading / yaw)
@@ -10,6 +10,7 @@ Performs an automated test sequence:
 1. Calibrate gyro (2 seconds stationary)
 2. Drive straight forward for 0.5 meters, then stop
 3. Turn right by 90 degrees, then stop
+If a front obstacle is detected within 800mm, it immediately triggers the OVERTAKE state.
 """
 
 import os
@@ -18,6 +19,7 @@ import time
 import math
 import serial
 import types
+import threading
 from dataclasses import dataclass
 
 # Add parent directory to path so we can import local jetracer package
@@ -31,12 +33,41 @@ SPEED_SCALE = 0.00748
 FORWARD_TARGET_DIST = 0.5   # Target forward distance in meters
 TURN_TARGET_DEG = 90.0      # Target turn angle in degrees
 
+# Lidar obstacle detection cache
+_lidar_cache = {"closest": 0.0, "blocked": False}
+_lidar_cache_lock = threading.Lock()
+
 @dataclass
 class State:
     x: float = 0.0
     y: float = 0.0
     yaw: float = 0.0      # In radians
     speed: float = 0.0    # In m/s
+
+
+def lidar_loop(car: JetRacer):
+    """
+    Background thread to poll Lidar and cache front distances.
+    Detects obstacles at 800mm distance.
+    """
+    print("[lidar] Background safety thread started")
+    while True:
+        try:
+            # Scan front cone (320-360 deg and 0-40 deg)
+            scan = car.lidar_scan(samples=150)
+            front_distances = [dist for ang, dist in scan.items() if (ang >= 320 or ang <= 40) and dist > 10]
+            closest_front = min(front_distances) if front_distances else 0.0
+            
+            # Block/trigger if obstacle is closer than 800mm
+            is_blocked = 0.0 < closest_front < 800.0
+            
+            with _lidar_cache_lock:
+                _lidar_cache["closest"] = round(closest_front, 1)
+                _lidar_cache["blocked"] = is_blocked
+        except Exception as e:
+            # Do not crash the thread on scan error
+            pass
+        time.sleep(0.10)
 
 
 def parse_telemetry_packet(ser, head1=0xAA, head2=0x55):
@@ -132,10 +163,11 @@ def silent_stop(self):
 
 
 def main():
-    # 1. Initialize JetRacer (PCA9685/Servo/Motor)
-    print("[init] Initializing JetRacer motor controller...")
+    # 1. Initialize JetRacer (PCA9685/Servo/Motor + RPLidar A1)
+    print("[init] Initializing JetRacer motor and Lidar controllers...")
     try:
-        car = JetRacer(init_lidar=False)
+        # Enable init_lidar to match the requirement
+        car = JetRacer(init_lidar=True)
         car.arm(delay=2)
         
         # Monkey-patch driver to prevent console logging on actuator updates
@@ -144,8 +176,7 @@ def main():
         car.stop = types.MethodType(silent_stop, car)
         
     except Exception as e:
-        print(f"\n[error] Failed to initialize JetRacer motor board: {e}")
-        print("Please verify connection to PCA9685 I2C interface.")
+        print(f"\n[error] Failed to initialize JetRacer: {e}")
         sys.exit(1)
 
     # 2. Attempt to open the serial port for RP2040 communication
@@ -162,6 +193,10 @@ def main():
     # 3. Perform gyro calibration
     gz_bias = calibrate_gyro(ser, duration=2.0)
 
+    # 4. Start the background Lidar thread
+    lt_thread = threading.Thread(target=lidar_loop, args=(car,), daemon=True)
+    lt_thread.start()
+
     # Initialize state variables
     state = State(x=0.0, y=0.0, yaw=0.0, speed=0.0)
     
@@ -175,15 +210,16 @@ def main():
     PHASE_PAUSE = 2
     PHASE_TURN_RIGHT = 3
     PHASE_DONE = 4
+    PHASE_OVERTAKE = 5
     
     current_phase = PHASE_DRIVE_FORWARD
     phase_start_time = time.time()
     phase_start_yaw = 0.0
 
     print("\n" + "="*60)
-    print("Automated State Estimation Verification")
+    print("Automated State Estimation & Lidar Trigger Verification")
     print(f"  Step 1: Drive forward {FORWARD_TARGET_DIST} meters")
-    print(f"  Step 2: Turn right {TURN_TARGET_DEG} degrees")
+    print("  Trigger: Obstacle < 800mm switches to OVERTAKE state")
     print("="*60 + "\n")
 
     try:
@@ -213,7 +249,6 @@ def main():
             gz_calibrated = gz_deg - gz_bias
             omega = math.radians(gz_calibrated)
             state.yaw += omega * dt
-            # Normalize yaw to [-pi, pi]
             state.yaw = (state.yaw + math.pi) % (2.0 * math.pi) - math.pi
 
             # ── 2. Calculate Encoder Speed ──
@@ -224,14 +259,20 @@ def main():
             state.x += state.speed * math.cos(state.yaw) * dt
             state.y += state.speed * math.sin(state.yaw) * dt
 
-            # ── 4. Automated Phase Logic ──
+            # ── 4. Check Lidar Trigger ──
+            with _lidar_cache_lock:
+                lidar_blocked = _lidar_cache["blocked"]
+                closest_dist = _lidar_cache["closest"]
+
+            if lidar_blocked and current_phase != PHASE_OVERTAKE:
+                current_phase = PHASE_OVERTAKE
+                print(f"\n[LIDAR TRIGGER] Obstacle detected at {closest_dist} mm! Switched to OVERTAKE state.")
+
+            # ── 5. Automated Phase Logic ──
             if current_phase == PHASE_DRIVE_FORWARD:
-                # Drive forward straight
                 car.steer(0.0)
                 car.throttle(0.15)
                 
-                # Check if distance target reached
-                # Since we started at x=0, y=0 pointing along x axis, x represents distance
                 distance_travelled = math.sqrt(state.x**2 + state.y**2)
                 if distance_travelled >= FORWARD_TARGET_DIST:
                     car.stop()
@@ -240,7 +281,6 @@ def main():
                     print(f"\n[auto] Forward phase complete. Reached {distance_travelled:.3f}m. Pausing...")
 
             elif current_phase == PHASE_PAUSE:
-                # Keep stopped
                 car.stop()
                 if time.time() - phase_start_time >= 1.0:
                     current_phase = PHASE_TURN_RIGHT
@@ -248,13 +288,10 @@ def main():
                     print("[auto] Pause complete. Starting turn phase...")
 
             elif current_phase == PHASE_TURN_RIGHT:
-                # Hard right turn (negative yaw change)
                 car.steer(0.8)
                 car.throttle(0.15)
                 
-                # Calculate relative yaw change in degrees
                 yaw_change = math.degrees(abs(state.yaw - phase_start_yaw))
-                # Handle wrapping issues in relative calculations
                 if yaw_change > 180.0:
                     yaw_change = 360.0 - yaw_change
                     
@@ -263,14 +300,18 @@ def main():
                     current_phase = PHASE_DONE
                     print(f"\n[auto] Turn phase complete. Turned {yaw_change:.1f}°. Verification finished successfully!")
 
-            # ── 5. Live Terminal Display ──
+            elif current_phase == PHASE_OVERTAKE:
+                # Overtake triggered: stop motors (only trigger that's it)
+                car.stop()
+
+            # ── 6. Live Terminal Display ──
             yaw_deg = math.degrees(state.yaw)
             phase_labels = {
                 PHASE_DRIVE_FORWARD: "DRIVING FORWARD",
                 PHASE_PAUSE: "PAUSED",
-                PHASE_TURN_RIGHT: "TURNING RIGHT"
+                PHASE_TURN_RIGHT: "TURNING RIGHT",
+                PHASE_OVERTAKE: "OVERTAKE STATE TRIGGERED"
             }
-            # \033[K clears from cursor to end of line
             print(
                 f"\r[{phase_labels.get(current_phase, 'UNKNOWN')}] "
                 f"X: {state.x:6.3f} m | Y: {state.y:6.3f} m | "
