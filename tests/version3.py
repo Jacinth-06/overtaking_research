@@ -430,27 +430,27 @@ def control_loop(car: JetRacer):
                     # Trigger Overtake state
                     autonomy_state = "OVERTAKING"
                     with state_lock:
-                        state["overtake_x"] = curr_x - 0.28 * math.sin(curr_yaw)
-                        state["overtake_y"] = curr_y + 0.28 * math.cos(curr_yaw)
-                        state["overtake_yaw"] = curr_yaw
+                        state["overtake_start_x"] = curr_x
+                        state["overtake_start_y"] = curr_y
+                        state["overtake_start_yaw"] = curr_yaw
                 
                 # In OVERTAKING state, track the parallel lane
                 with state_lock:
-                    ox = state.get("overtake_x", curr_x)
-                    oy = state.get("overtake_y", curr_y)
-                    oyaw = state.get("overtake_yaw", curr_yaw)
+                    sx = state.get("overtake_start_x", curr_x)
+                    sy = state.get("overtake_start_y", curr_y)
+                    syaw = state.get("overtake_start_yaw", curr_yaw)
                 
-                dx_track = curr_x - ox
-                dy_track = curr_y - oy
-                closest_s = dx_track * math.cos(oyaw) + dy_track * math.sin(oyaw)
+                # Use IMU and encoder to calculate lateral distance to the RIGHT
+                dx = curr_x - sx
+                dy = curr_y - sy
+                dist_right = dx * math.sin(syaw) - dy * math.cos(syaw)
                 
-                tx = ox + (closest_s + Ld) * math.cos(oyaw)
-                ty = oy + (closest_s + Ld) * math.sin(oyaw)
+                # Track a line 0.28m to the right without setting a forward target point
+                E_left = dist_right - 0.28
+                theta_e = (curr_yaw - syaw + math.pi) % (2 * math.pi) - math.pi
                 
-                global_dx = tx - curr_x
-                global_dy = ty - curr_y
-                local_x = global_dx * math.cos(-curr_yaw) - global_dy * math.sin(-curr_yaw)
-                local_y = global_dx * math.sin(-curr_yaw) + global_dy * math.cos(-curr_yaw)
+                # Pure pursuit local_y based on lateral offset and heading error
+                local_y = E_left - Ld * math.sin(theta_e)
                 
                 gamma = 2.0 * local_y / (Ld ** 2)
                 delta = math.atan(L * gamma)
