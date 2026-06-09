@@ -60,8 +60,6 @@ state = {
     # ROI
     "roi_top_frac": 0.5,
     "roi_side_limit": 0.0,
-    # PID
-    "kp": 0.55,  "ki": 0.003,  "kd": 0.25,
     # Drive
     "speed": 0.15,
     "enabled": False,
@@ -75,12 +73,12 @@ state = {
     # Telemetry (read-only from browser)
     "error": 0.0, "steer": 0.0, "fps": 0,
     "lane_found": False,
+    "lane_width": 0.0,
     "lidar_closest": 0.0,     # closest front distance in mm
     "lidar_blocked": False,   # True when obstacle within stop_distance
     "autonomy_state": "FOLLOW",
 }
 
-pid_state  = {"integral": 0.0, "last_error": 0.0, "last_time": time.time()}
 state_lock = threading.Lock()
 
 _last_steer = 0.0
@@ -172,7 +170,6 @@ def to_gray(bgr):
 
 # ── Frame processing pipeline ────────────────────────────────────────────────
 def process_frame(frame, s, annotate: bool):
-    global _last_steer
     h, w = frame.shape[:2]
     roi_top = int(h * s.get("roi_top_frac", 0.5))
     x_start = int(w * s.get("roi_side_limit", 0.0))
@@ -195,6 +192,7 @@ def process_frame(frame, s, annotate: bool):
 
     ys, xs = np.where(roi_mask > 0)
     lane_found = False
+    lane_width = 0.0
 
     if len(xs) > 50:
         lane_found = True
@@ -211,6 +209,7 @@ def process_frame(frame, s, annotate: bool):
             left_x = np.mean(left_pixels) + x_start
             right_x = np.mean(right_pixels) + x_start
             target_x = (left_x + right_x) / 2.0
+            lane_width = right_x - left_x
         elif len(left_pixels) > 10:
             left_x = np.mean(left_pixels) + x_start
             target_x = left_x + 140
@@ -220,24 +219,9 @@ def process_frame(frame, s, annotate: bool):
         else:
             target_x = w / 2.0
 
-        error = (target_x - w / 2.0) / (w / 2.0) * 3.5
-
-        now = time.time()
-        dt  = max(now - pid_state["last_time"], 0.001)
-        pid_state["integral"]  += error * dt
-        pid_state["integral"]   = max(-1.0, min(1.0, pid_state["integral"]))
-        derivative              = (error - pid_state["last_error"]) / dt
-        pid_state["last_error"] = error
-        pid_state["last_time"]  = now
-
-        steer = (s["kp"] * error
-               + s["ki"] * pid_state["integral"]
-               + s["kd"] * derivative)
-        steer = max(-1.0, min(1.0, steer))
-        _last_steer = steer
+        dx_pixels = target_x - w / 2.0
     else:
-        error = 0.0
-        steer = _last_steer
+        dx_pixels = 0.0
         target_x = w / 2.0
 
     if annotate:
@@ -256,7 +240,7 @@ def process_frame(frame, s, annotate: bool):
     else:
         annotated = frame
 
-    return annotated, error, steer, lane_found
+    return annotated, dx_pixels, lane_found, lane_width
 
 def _do_encode(img):
     ret, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
@@ -388,10 +372,11 @@ def sensor_loop(ser, gz_bias):
 
 # ── Control Thread ────────────────────────────────────────────────────────────
 def control_loop(car: JetRacer):
+    global _last_steer
     cap = open_camera()
     fps_counter, fps_time = 0, time.time()
     frame_idx = 0
-    print("[loop] Control loop started")
+    print("[loop] Control loop started (Pure Pursuit)")
 
     while True:
         ret, frame = cap.read()
@@ -409,7 +394,7 @@ def control_loop(car: JetRacer):
             has_clients = stream_clients > 0
 
         do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
-        annotated, error, steer, lane_found = process_frame(frame, s_copy, do_annotate)
+        annotated, dx_pixels, lane_found, lane_width = process_frame(frame, s_copy, do_annotate)
 
         if do_annotate:
             _encode_pool.submit(_do_encode, annotated)
@@ -432,28 +417,74 @@ def control_loop(car: JetRacer):
 
         autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
 
+        # PURE PURSUIT PARAMETERS
+        Ld = 0.25 + 0.8 * curr_speed
+        Ld = max(0.4, Ld) # safety min
+        L = 0.16
+        max_steer_rad = 0.52
+
         # STATE MACHINE Logic
         if s_copy["enabled"]:
             if lidar_blocked:
-                # Trigger Overtake state and stop
-                autonomy_state = "OVERTAKING"
-                car.stop()
+                if autonomy_state == "FOLLOW":
+                    # Trigger Overtake state
+                    autonomy_state = "OVERTAKING"
+                    with state_lock:
+                        state["overtake_x"] = curr_x - 0.28 * math.sin(curr_yaw)
+                        state["overtake_y"] = curr_y + 0.28 * math.cos(curr_yaw)
+                        state["overtake_yaw"] = curr_yaw
+                
+                # In OVERTAKING state, track the parallel lane
+                with state_lock:
+                    ox = state.get("overtake_x", curr_x)
+                    oy = state.get("overtake_y", curr_y)
+                    oyaw = state.get("overtake_yaw", curr_yaw)
+                
+                dx_track = curr_x - ox
+                dy_track = curr_y - oy
+                closest_s = dx_track * math.cos(oyaw) + dy_track * math.sin(oyaw)
+                
+                tx = ox + (closest_s + Ld) * math.cos(oyaw)
+                ty = oy + (closest_s + Ld) * math.sin(oyaw)
+                
+                global_dx = tx - curr_x
+                global_dy = ty - curr_y
+                local_x = global_dx * math.cos(-curr_yaw) - global_dy * math.sin(-curr_yaw)
+                local_y = global_dx * math.sin(-curr_yaw) + global_dy * math.cos(-curr_yaw)
+                
+                gamma = 2.0 * local_y / (Ld ** 2)
+                delta = math.atan(L * gamma)
+                steer = -delta / max_steer_rad
+                
             else:
                 if autonomy_state == "OVERTAKING":
                     # Obstacle cleared, resume following
                     autonomy_state = "FOLLOW"
                 
                 if autonomy_state == "FOLLOW":
-                    car.steer(steer)
-                    car.forward(s_copy["speed"])
+                    if lane_found:
+                        # Convert pixel error to lateral offset
+                        local_y = (dx_pixels / 160.0) * 0.5
+                        gamma = 2.0 * local_y / (Ld ** 2)
+                        delta = math.atan(L * gamma)
+                        steer = -delta / max_steer_rad
+                    else:
+                        steer = _last_steer
+                        
+            steer = max(-1.0, min(1.0, steer))
+            _last_steer = steer
+            car.steer(steer)
+            car.forward(s_copy["speed"])
         else:
             car.stop()
+            steer = 0.0
             autonomy_state = "FOLLOW"
 
         with state_lock:
-            state["error"] = round(error, 3)
+            state["error"] = round(dx_pixels, 3)
             state["steer"] = round(steer, 3)
             state["lane_found"] = lane_found
+            state["lane_width"] = round(lane_width, 1)
             state["lidar_closest"] = lidar_closest
             state["lidar_blocked"] = lidar_blocked
             state["autonomy_state"] = autonomy_state
@@ -551,6 +582,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <span class="stat-lbl">steer</span></div>
       <div class="stat"><span class="stat-val" id="v-lane">&mdash;</span>
                         <span class="stat-lbl">lane</span></div>
+      <div class="stat"><span class="stat-val" id="v-lanew">0.0</span>
+                        <span class="stat-lbl">lane w</span></div>
       <div class="stat"><span class="stat-val" id="v-lidar">0</span>
                         <span class="stat-lbl">lidar front</span></div>
     </div>
@@ -568,23 +601,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="btn-row">
       <button id="btn-go"   onclick="setEnabled(true)">&#9654; GO</button>
       <button id="btn-stop" onclick="setEnabled(false)">&#9632; STOP</button>
-    </div>
-    <hr class="divider">
-    <h2>PID gains</h2>
-    <div class="slider-row">
-      <label>Kp</label>
-      <input type="range" id="kp" min="0" max="2" value="0.55" step="0.01">
-      <span class="val" id="v-kp">0.55</span>
-    </div>
-    <div class="slider-row">
-      <label>Ki</label>
-      <input type="range" id="ki" min="0" max="0.05" value="0.003" step="0.001">
-      <span class="val" id="v-ki">0.003</span>
-    </div>
-    <div class="slider-row">
-      <label>Kd</label>
-      <input type="range" id="kd" min="0" max="0.5" value="0.25" step="0.01">
-      <span class="val" id="v-kd">0.25</span>
     </div>
     <hr class="divider">
     <h2>Vision pipeline</h2>
@@ -634,7 +650,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </div>
 <script>
 const sliders = [
-  "speed","kp","ki","kd",
+  "speed",
   "canny_lo","canny_hi","binary_thresh","blur_ksize",
   "morph_ksize","morph_iters",
   "roi_top_frac","stop_distance"
@@ -687,13 +703,15 @@ async function poll() {
     laneEl.textContent = d.lane_found ? "✓" : "✗";
     laneEl.style.color = d.lane_found ? "#00d4aa" : "#ff4d4d";
 
+    document.getElementById("v-lanew").textContent = (d.lane_width || 0).toFixed(1);
+
     const lidarEl = document.getElementById("v-lidar");
     lidarEl.textContent = d.lidar_closest.toFixed(0);
 
-    const pct = (d.error + 1) / 2 * 100;
+    const pct = (d.error / 160.0 + 1) / 2 * 100;
     const bar = document.getElementById("error-bar");
     bar.style.left = pct + "%";
-    bar.style.background = Math.abs(d.error) > 0.5 ? "#ff4d4d" : "#00d4aa";
+    bar.style.background = Math.abs(d.error) > 80 ? "#ff4d4d" : "#00d4aa";
   } catch(e) {}
   setTimeout(poll, 250);
 }
@@ -733,7 +751,7 @@ def video_feed():
 def status():
     with state_lock:
         return jsonify({k: state[k] for k in
-                        ("fps", "error", "steer", "lane_found", "enabled",
+                        ("fps", "error", "steer", "lane_found", "lane_width", "enabled",
                          "lidar_closest", "lidar_blocked", "autonomy_state",
                          "x", "y", "yaw", "dr_speed")})
 
@@ -744,9 +762,6 @@ def set_param():
         for k, v in data.items():
             if k in state:
                 state[k] = v
-                if k in ("kp", "ki", "kd"):
-                    pid_state["integral"]   = 0.0
-                    pid_state["last_error"] = 0.0
     return jsonify({"ok": True})
 
 # --- Silent overrides for JetRacer driver to keep output clean ---
