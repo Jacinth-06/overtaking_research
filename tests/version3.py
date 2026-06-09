@@ -418,8 +418,8 @@ def control_loop(car: JetRacer):
         autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
 
         # PURE PURSUIT PARAMETERS
-        Ld = 0.25 + 0.8 * curr_speed
-        Ld = max(0.4, Ld) # safety min
+        Ld = 0.2 + 0.8 * curr_speed
+        Ld = max(0.25, Ld) # safety min
         L = 0.16
         max_steer_rad = 0.52
 
