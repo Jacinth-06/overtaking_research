@@ -287,7 +287,10 @@ def lidar_loop(car: JetRacer):
                 _lidar_cache["blocked"] = is_blocked
                 
         except Exception as e:
-            pass
+            print(f"[lidar] scan error: {e}")
+            with _lidar_cache_lock:
+                _lidar_cache["closest"] = 0.0
+                _lidar_cache["blocked"] = True
         time.sleep(0.10)
 
 # ── State Estimation / Sensor Thread ──────────────────────────────────────────
@@ -792,12 +795,12 @@ if __name__ == "__main__":
         car.stop()
         sys.exit(1)
 
-    # Perform gyro calibration
-    gz_bias = calibrate_gyro(ser, duration=2.0)
-
-    # Start background threads
+    # Start the Lidar background thread FIRST so it doesn't buffer overflow during gyro calibration
     lt = threading.Thread(target=lidar_loop, args=(car,), daemon=True)
     lt.start()
+
+    # Perform gyro calibration (blocks for 2.0s)
+    gz_bias = calibrate_gyro(ser, duration=2.0)
 
     st = threading.Thread(target=sensor_loop, args=(ser, gz_bias), daemon=True)
     st.start()
