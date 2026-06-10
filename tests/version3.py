@@ -77,6 +77,7 @@ state = {
     "lidar_closest": 0.0,     # closest front distance in mm
     "lidar_blocked": False,   # True when obstacle within stop_distance
     "autonomy_state": "FOLLOW",
+    "reset_odom": False,
 }
 
 state_lock = threading.Lock()
@@ -345,6 +346,14 @@ def sensor_loop(ser, gz_bias):
             if dt <= 0:
                 continue
 
+            with state_lock:
+                if state.get("reset_odom", False):
+                    curr_x = 0.0
+                    curr_y = 0.0
+                    curr_yaw = 0.0
+                    curr_speed = 0.0
+                    state["reset_odom"] = False
+
             gz_deg, lvel, rvel = parsed
             
             # Gyro Heading (Yaw)
@@ -434,27 +443,9 @@ def control_loop(car: JetRacer):
                         state["overtake_start_y"] = curr_y
                         state["overtake_start_yaw"] = curr_yaw
                 
-                # In OVERTAKING state, track the parallel lane
-                with state_lock:
-                    sx = state.get("overtake_start_x", curr_x)
-                    sy = state.get("overtake_start_y", curr_y)
-                    syaw = state.get("overtake_start_yaw", curr_yaw)
-                
-                # Use IMU and encoder to calculate lateral distance to the RIGHT
-                dx = curr_x - sx
-                dy = curr_y - sy
-                dist_right = dx * math.sin(syaw) - dy * math.cos(syaw)
-                
-                # Track a line 0.28m to the right without setting a forward target point
-                E_left = dist_right - 0.28
-                theta_e = (curr_yaw - syaw + math.pi) % (2 * math.pi) - math.pi
-                
-                # Pure pursuit local_y based on lateral offset and heading error
-                local_y = E_left - Ld * math.sin(theta_e)
-                
-                gamma = 2.0 * local_y / (Ld ** 2)
-                delta = math.atan(L * gamma)
-                steer = -delta / max_steer_rad
+                # Make the car stop
+                steer = _last_steer
+                car.stop()
                 
             else:
                 if autonomy_state == "OVERTAKING":
@@ -471,10 +462,10 @@ def control_loop(car: JetRacer):
                     else:
                         steer = _last_steer
                         
-            steer = max(-1.0, min(1.0, steer))
-            _last_steer = steer
-            car.steer(steer)
-            car.forward(s_copy["speed"])
+                steer = max(-1.0, min(1.0, steer))
+                _last_steer = steer
+                car.steer(steer)
+                car.forward(s_copy["speed"])
         else:
             car.stop()
             steer = 0.0
@@ -762,6 +753,8 @@ def set_param():
         for k, v in data.items():
             if k in state:
                 state[k] = v
+                if k == "enabled" and v == False:
+                    state["reset_odom"] = True
     return jsonify({"ok": True})
 
 # --- Silent overrides for JetRacer driver to keep output clean ---
