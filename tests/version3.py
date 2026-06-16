@@ -605,58 +605,61 @@ def control_loop(car: JetRacer):
 
         # STATE MACHINE
         if s_copy["enabled"]:
-    if autonomy_state == "FOLLOW":
-        if lidar_blocked:
-            autonomy_state = "OVERTAKING"
-            # Reset odometry NOW so pos_y is clean relative to maneuver start
+            if autonomy_state == "FOLLOW":
+                if lidar_blocked:
+                    autonomy_state = "OVERTAKING"
+                    # Reset odometry NOW so pos_y is clean relative to maneuver start
+                    yaw = 0.0
+                    pos_y = 0.0
+                    pid_traj["integral"] = 0.0
+                    pid_traj["last_error"] = 0.0
+                    pid_state["start_enc_dist"] = enc_dist
+                    pid_state["start_pos_y"] = 0.0
+                    pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
+                    print(f"[STATE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
+                car.steer(steer)
+                car.forward(s_copy["speed"])
+
+            elif autonomy_state == "OVERTAKING":
+                s = enc_dist - pid_state.get("start_enc_dist", enc_dist)
+                D = pid_state.get("lane_change_dist", OVERTAKE_MANEUVER_DIST)
+
+                if s < D:
+                    s_ratio = s / D
+                    poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
+                    target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
+                else:
+                    target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
+                    # Maneuver complete — check if obstacle is cleared before returning
+                    if not lidar_blocked:
+                        print("[STATE] -> FOLLOW (obstacle cleared)", flush=True)
+                        autonomy_state = "FOLLOW"
+                        yaw = 0.0
+                        pos_y = 0.0
+
+                traj_error = target_y - pos_y
+
+                pid_traj["integral"] += traj_error * dt
+                pid_traj["integral"] = max(-1.0, min(1.0, pid_traj["integral"]))
+                derivative = (traj_error - pid_traj["last_error"]) / dt
+                pid_traj["last_error"] = traj_error
+
+                steer_cmd = TRAJ_KP * traj_error + TRAJ_KI * pid_traj["integral"] + TRAJ_KD * derivative
+                steer_cmd = max(-1.0, min(1.0, steer_cmd))
+
+                car.steer(steer_cmd)
+                car.forward(s_copy["speed"])
+                steer = steer_cmd
+
+        else:
+            car.stop()
+            autonomy_state = "FOLLOW"
             yaw = 0.0
             pos_y = 0.0
-            pid_traj["integral"] = 0.0
-            pid_traj["last_error"] = 0.0
-            pid_state["start_enc_dist"] = enc_dist
-            pid_state["start_pos_y"] = 0.0   # always zero now
-            pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
-            print(f"[STATE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
 
-        car.steer(steer)
-        car.forward(s_copy["speed"])
 
-    elif autonomy_state == "OVERTAKING":
-        s = enc_dist - pid_state.get("start_enc_dist", enc_dist)
-        D = pid_state.get("lane_change_dist", OVERTAKE_MANEUVER_DIST)
 
-        if s < D:
-            s_ratio = s / D
-            poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
-            target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
-        else:
-            target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
-            # Maneuver complete — check if obstacle is cleared before returning
-            if not lidar_blocked:
-                print("[STATE] -> FOLLOW (obstacle cleared)", flush=True)
-                autonomy_state = "FOLLOW"
-                yaw = 0.0
-                pos_y = 0.0
-
-        traj_error = target_y - pos_y
-
-        pid_traj["integral"] += traj_error * dt
-        pid_traj["integral"] = max(-1.0, min(1.0, pid_traj["integral"]))
-        derivative = (traj_error - pid_traj["last_error"]) / dt
-        pid_traj["last_error"] = traj_error
-
-        # Use trajectory-specific gains, not lane-follow gains
-        steer_cmd = TRAJ_KP * traj_error + TRAJ_KI * pid_traj["integral"] + TRAJ_KD * derivative
-        steer_cmd = max(-1.0, min(1.0, steer_cmd))
-
-        car.steer(steer_cmd)
-        car.forward(s_copy["speed"])
-        steer = steer_cmd
-    else:
-        car.stop()
-        autonomy_state = "FOLLOW"
-        yaw = 0.0
-        pos_y = 0.0
+       
 
         with state_lock:
             state["error"]         = round(error, 3)
