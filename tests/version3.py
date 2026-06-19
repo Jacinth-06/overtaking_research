@@ -12,7 +12,7 @@ Detection pipeline:
 
 Safety layer:
   lidar front cone (320°–360° + 0°–40°) → if min distance < STOP_DISTANCE → override stop
-  Lidar runs in its own background thread at ~20 Hz so it never blocks the camera loop.
+  Lidar runs in its own background thread at ~10 Hz so it never blocks the camera loop.
 
 Run:   python version3.py
 Open:  http://<jetson-ip>:5000
@@ -364,7 +364,7 @@ def firebase_loop():
             last_upload_time = now
 
 # ── Lidar background thread ───────────────────────────────────────────────────
-# Runs independently at ~20 Hz; never blocks the camera / vision loop.
+# Runs independently at ~10 Hz; never blocks the camera / vision loop.
 # The control loop does a cheap non-blocking dict read instead of calling
 # car.lidar_scan() every frame (which was the main FPS killer).
 
@@ -406,7 +406,7 @@ def lidar_loop(car: JetRacer):
                 _lidar_cache["closest_left"] = 0.0
                 _lidar_cache["blocked"] = True
 
-        time.sleep(0.05)   # ~20 Hz — fast enough for obstacle reaction
+        time.sleep(0.10)   # ~10 Hz — fast enough for obstacle reaction
 
 
 
