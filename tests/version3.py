@@ -60,8 +60,8 @@ MJPEG_INTERVAL  = 1 / 15
 state = {
     # Canny
     "canny_lo": 50,   "canny_hi": 150,
-    # Binary threshold
-    "binary_thresh": 200,
+    # Binary threshold (lowered from 200 to 120 for evening/dimmer lighting)
+    "binary_thresh": 120,
     # Gaussian blur
     "blur_ksize": 5,
     # Morphology
@@ -628,14 +628,14 @@ def control_loop(car: JetRacer):
                 if s < D:
                     s_ratio = s / D
     
-        # 1. Standard ultra-smooth quintic
+                    # 1. Standard ultra-smooth quintic
                     poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
     
-    # 2. Asymmetric kick: Strong at 0, decays to 0 at 1
-    # (1 - s_ratio) ensures the kick is completely gone by the end
+                    # 2. Asymmetric kick: Strong at 0, decays to 0 at 1
+                    # (1 - s_ratio) ensures the kick is completely gone by the end
                     kick = (s_ratio ** 0.5) * (1.0 - s_ratio)
     
-    # 3. Blend them (adjust 0.4 to increase/decrease the initial kick)
+                    # 3. Blend them (adjust 0.4 to increase/decrease the initial kick)
                     poly = poly + 0.4 * kick
     
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
