@@ -541,7 +541,7 @@ def control_loop(car: JetRacer):
     LANE_WIDTH_ACTUAL = 0.28
     LANE_WIDTH = LANE_WIDTH_ACTUAL*0.5   # meters to shift laterally
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
-    OVERTAKE_MANEUVER_DIST = 0.25  # meters of forward travel to complete lane change
+    OVERTAKE_MANEUVER_DIST = 0.30  # meters of forward travel to complete lane change
     # 30cm is aggressive but realistic for 15cm wheelbase
     
     print("[loop] Control loop started")
