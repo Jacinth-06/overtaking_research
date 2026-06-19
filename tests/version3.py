@@ -627,8 +627,17 @@ def control_loop(car: JetRacer):
 
                 if s < D:
                     s_ratio = s / D
+    
+        # 1. Standard ultra-smooth quintic
                     poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
-                    poly = 0.3 * s_ratio + 0.7 * poly 
+    
+    # 2. Asymmetric kick: Strong at 0, decays to 0 at 1
+    # (1 - s_ratio) ensures the kick is completely gone by the end
+                    kick = (s_ratio ** 0.5) * (1.0 - s_ratio)
+    
+    # 3. Blend them (adjust 0.4 to increase/decrease the initial kick)
+                    poly = poly + 0.4 * kick
+    
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
                 else:
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
