@@ -547,12 +547,17 @@ def control_loop(car: JetRacer):
     # prone to producing little/no visible steering when the double-
     # integrated IMU position estimate drifted or got noisy.
     WHEELBASE = 0.15            # meters — JetRacer wheelbase
-    STEER_GAIN = 4.0            # tune this against your actual steer range/response
+    MAX_STEER_DEG = 25          # car's approximate max steering lock (one side) — measure/adjust this
+    STEER_GAIN = 1.0 / math.radians(MAX_STEER_DEG)   # converts the geometric steer angle (radians) -> normalised [-1,1] command
+    OVERTAKE_DIRECTION = -1.0   # flip to +1.0 if the maneuver goes the wrong way again
     LANE_WIDTH_ACTUAL = 0.28
-    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.5   # meters to shift laterally (flip sign to overtake the other way)
+    LANE_WIDTH = OVERTAKE_DIRECTION * LANE_WIDTH_ACTUAL * 0.5   # meters to shift laterally
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
-    OVERTAKE_MANEUVER_DIST = 0.30  # meters of forward travel to complete lane change
-    # 30cm is aggressive but realistic for 15cm wheelbase
+    OVERTAKE_MANEUVER_DIST = 0.60  # meters of forward travel to complete lane change
+    # Raised from 0.30 -> 0.60: shifting LANE_WIDTH over too short a distance demands a
+    # steering angle beyond what a 15cm-wheelbase car can physically produce, which is
+    # why it was slamming to full lock almost immediately. Doubling the distance roughly
+    # halves the peak required angle (~53° -> ~19°), well inside MAX_STEER_DEG.
 
     print("[loop] Control loop started")
 
