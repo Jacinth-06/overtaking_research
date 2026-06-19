@@ -538,7 +538,8 @@ def control_loop(car: JetRacer):
     TRAJ_KP = 3.5   # Much higher — traj_error is in meters, not pixels
     TRAJ_KI = 0.1
     TRAJ_KD = 0.8
-    LANE_WIDTH = 0.28*0.7   # meters
+    LANE_WIDTH_ACTUAL = 0.28
+    LANE_WIDTH = LANE_WIDTH_ACTUAL*0.6   # meters to shift laterally
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
     OVERTAKE_MANEUVER_DIST = 0.30  # meters of forward travel to complete lane change
     # 30cm is aggressive but realistic for 15cm wheelbase
