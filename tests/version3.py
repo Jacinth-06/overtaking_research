@@ -628,6 +628,7 @@ def control_loop(car: JetRacer):
                 if s < D:
                     s_ratio = s / D
                     poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
+                    poly = 0.3 * s_ratio + 0.7 * poly 
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
                 else:
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
