@@ -154,9 +154,14 @@ def main():
         time.sleep(0.5)
 
         # ── Phase 2: turn right ~90° ─────────────────────────────────────
+        # ── Phase 2: turn right ~90° ─────────────────────────────────────
         print(f"[test] Phase 2: turning right {TURN_TARGET_DEG:.0f}°")
+        
+        # CRITICAL RESET STEP: Wipe out any drift accumulated during Phase 1
         yaw_deg = 0.0
-        last_time = time.time()
+        
+        # CRITICAL RESET STEP: Flush out old timestamps so 'dt' starts clean
+        last_time = time.time() 
 
         car.steer(STEER_RIGHT)
         car.forward(DRIVE_SPEED)
@@ -169,6 +174,7 @@ def main():
             with _cache_lock:
                 gz = _imu_cache["gz"]
 
+            # Software integration of the reset values
             yaw_deg += TURN_SIGN * gz * dt
             time.sleep(1.0 / LOOP_HZ)
 
