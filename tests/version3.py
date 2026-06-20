@@ -539,13 +539,19 @@ def control_loop(car: JetRacer):
     TRAJ_KI = 0.1
     TRAJ_KD = 0.8
     LANE_WIDTH_ACTUAL = 0.28
-    LANE_WIDTH = LANE_WIDTH_ACTUAL*0.8   # meters to shift laterally
+    LANE_WIDTH = LANE_WIDTH_ACTUAL*0.5   # meters to shift laterally
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
     OVERTAKE_MANEUVER_DIST = 0.30  # meters of forward travel to complete lane change
     # 30cm is aggressive but realistic for 15cm wheelbase
     # FIX: hard safety cap — if lidar_blocked never clears (sensor glitch, obstacle
     # parked alongside), don't hold the lane-change PID forever. Force exit here.
-    OVERTAKE_MAX_DIST = OVERTAKE_MANEUVER_DIST * 2.5
+    # Shared by OVERTAKING and RECOVERY (same physical maneuver length scale).
+    MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 2.5
+    # FIX: RECOVERY has no external sensor to gate on like OVERTAKING does
+    # (lidar_blocked) — it's a pure dead-reckoned maneuver. Exiting on distance
+    # alone let it bail before pos_y had actually caught up to target_y. Instead,
+    # require it to actually be close to the target lane position before exiting.
+    RECOVERY_POS_TOLERANCE = 0.03  # meters
     
     print("[loop] Control loop started")
 
@@ -664,7 +670,7 @@ def control_loop(car: JetRacer):
                     # was actually cleared. Hold here until lidar clears, same as the
                     # working simple version — with a hard distance cap as a fallback
                     # so we never get stuck here forever.
-                    if (not lidar_blocked) or (s >= OVERTAKE_MAX_DIST):
+                    if (not lidar_blocked) or (s >= MANEUVER_MAX_DIST):
                         print(f"[STATE] -> FOLLOW (overtake done, enc_dist={enc_dist:.3f})", flush=True)
                         autonomy_state = "FOLLOW"
                         pid_state["is_post_overtake"] = True
@@ -702,12 +708,20 @@ def control_loop(car: JetRacer):
                     target_y = pid_state.get("start_pos_y", 0.0) - LANE_WIDTH * poly
                 else:
                     target_y = pid_state.get("start_pos_y", 0.0) - LANE_WIDTH
+
+                traj_error = target_y - pos_y
+
+                # FIX: don't exit purely on distance — only declare recovery
+                # complete once pos_y has actually caught up to target_y (or
+                # we hit the hard safety cap). This was the bug: it used to
+                # flip back to FOLLOW the instant s>=D even if the PID hadn't
+                # converged yet, so the car never actually got back to the
+                # original lane before reverting to plain lane-centering.
+                if s >= D and (abs(traj_error) < RECOVERY_POS_TOLERANCE or s >= MANEUVER_MAX_DIST):
                     print("[STATE] -> FOLLOW (recovery complete)", flush=True)
                     autonomy_state = "FOLLOW"
                     yaw = 0.0
                     pos_y = 0.0
-
-                traj_error = target_y - pos_y
 
                 pid_traj["integral"] += traj_error * dt
                 pid_traj["integral"] = max(-1.0, min(1.0, pid_traj["integral"]))
