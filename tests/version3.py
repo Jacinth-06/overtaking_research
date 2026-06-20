@@ -607,33 +607,17 @@ def control_loop(car: JetRacer):
         # STATE MACHINE
         if s_copy["enabled"]:
             if autonomy_state == "FOLLOW":
-                if pid_state.get("is_overtaken", False):
-                    # We are in the left lane, tracking distance
-                    s_follow = enc_dist - pid_state.get("start_enc_dist_follow", enc_dist)
-                    if s_follow >= 0.05:
-                        if lidar_closest_left > 400.0:
-                            print("[STATE] -> RECOVERY (obstacle cleared)", flush=True)
-                            autonomy_state = "RECOVERY"
-                            pid_state["is_overtaken"] = False
-                            yaw = 0.0
-                            pos_y = 0.0
-                            pid_traj["integral"] = 0.0
-                            pid_traj["last_error"] = 0.0
-                            pid_state["start_enc_dist"] = enc_dist
-                            pid_state["start_pos_y"] = 0.0
-                            pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
-                else:
-                    if lidar_blocked:
-                        autonomy_state = "OVERTAKING"
-                        # Reset odometry NOW so pos_y is clean relative to maneuver start
-                        yaw = 0.0
-                        pos_y = 0.0
-                        pid_traj["integral"] = 0.0
-                        pid_traj["last_error"] = 0.0
-                        pid_state["start_enc_dist"] = enc_dist
-                        pid_state["start_pos_y"] = 0.0
-                        pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
-                        print(f"[STATE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
+                if lidar_blocked:
+                    autonomy_state = "OVERTAKING"
+                    # Reset odometry NOW so pos_y is clean relative to maneuver start
+                    yaw = 0.0
+                    pos_y = 0.0
+                    pid_traj["integral"] = 0.0
+                    pid_traj["last_error"] = 0.0
+                    pid_state["start_enc_dist"] = enc_dist
+                    pid_state["start_pos_y"] = 0.0
+                    pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
+                    print(f"[STATE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
                 car.steer(steer)
                 car.forward(s_copy["speed"])
 
@@ -657,43 +641,12 @@ def control_loop(car: JetRacer):
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
                 else:
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
-                    # Maneuver complete — go to FOLLOW
-                    if autonomy_state != "FOLLOW":
-                        print("[STATE] -> FOLLOW (in left lane)", flush=True)
+                    # Maneuver complete — check if obstacle is cleared before returning
+                    if not lidar_blocked:
+                        print("[STATE] -> FOLLOW (obstacle cleared)", flush=True)
                         autonomy_state = "FOLLOW"
-                        pid_state["is_overtaken"] = True
-                        pid_state["start_enc_dist_follow"] = enc_dist
-
-                traj_error = target_y - pos_y
-
-                pid_traj["integral"] += traj_error * dt
-                pid_traj["integral"] = max(-1.0, min(1.0, pid_traj["integral"]))
-                derivative = (traj_error - pid_traj["last_error"]) / dt
-                pid_traj["last_error"] = traj_error
-
-                steer_cmd = TRAJ_KP * traj_error + TRAJ_KI * pid_traj["integral"] + TRAJ_KD * derivative
-                steer_cmd = max(-1.0, min(1.0, steer_cmd))
-
-                car.steer(steer_cmd)
-                car.forward(s_copy["speed"])
-                steer = steer_cmd
-
-            elif autonomy_state == "RECOVERY":
-                s = enc_dist - pid_state.get("start_enc_dist", enc_dist)
-                D = pid_state.get("lane_change_dist", OVERTAKE_MANEUVER_DIST)
-
-                if s < D:
-                    s_ratio = s / D
-                    poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
-                    kick = (s_ratio ** 0.5) * (1.0 - s_ratio)
-                    poly = poly + 0.4 * kick
-                    target_y = pid_state.get("start_pos_y", 0.0) - LANE_WIDTH * poly
-                else:
-                    target_y = pid_state.get("start_pos_y", 0.0) - LANE_WIDTH
-                    print("[STATE] -> FOLLOW (recovery complete)", flush=True)
-                    autonomy_state = "FOLLOW"
-                    yaw = 0.0
-                    pos_y = 0.0
+                        yaw = 0.0
+                        pos_y = 0.0
 
                 traj_error = target_y - pos_y
 
