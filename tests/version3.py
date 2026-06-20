@@ -641,17 +641,18 @@ def control_loop(car: JetRacer):
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
                 else:
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
-                    # Maneuver complete — check if obstacle is cleared before returning
-                    if lidar_closest_left > 400.0:
-                        print("[STATE] -> RECOVERY (obstacle cleared)", flush=True)
-                        autonomy_state = "RECOVERY"
-                        yaw = 0.0
-                        pos_y = 0.0
-                        pid_traj["integral"] = 0.0
-                        pid_traj["last_error"] = 0.0
-                        pid_state["start_enc_dist"] = enc_dist
-                        pid_state["start_pos_y"] = 0.0
-                        pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
+                    # Maneuver complete — travel straight for 0.05m before checking lidar
+                    if s >= D + 0.05:
+                        if lidar_closest_left > 400.0:
+                            print("[STATE] -> RECOVERY (obstacle cleared)", flush=True)
+                            autonomy_state = "RECOVERY"
+                            yaw = 0.0
+                            pos_y = 0.0
+                            pid_traj["integral"] = 0.0
+                            pid_traj["last_error"] = 0.0
+                            pid_state["start_enc_dist"] = enc_dist
+                            pid_state["start_pos_y"] = 0.0
+                            pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
 
                 traj_error = target_y - pos_y
 
