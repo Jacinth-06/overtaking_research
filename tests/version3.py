@@ -619,9 +619,9 @@ def control_loop(car: JetRacer):
                     pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
                     print(f"[STATE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
                 elif pid_state.get("is_post_overtake", False):
-                    # Arrived here after OVERTAKING — wait 0.15m then check left lidar
+                    # Arrived here after OVERTAKING — wait 0.2m then check left lidar
                     s_follow = enc_dist - pid_state.get("post_overtake_enc_dist", enc_dist)
-                    if s_follow >= 0.15 and lidar_closest_left > 400.0:
+                    if s_follow >= 0.2 and lidar_closest_left > 400.0:
                         print("[STATE] -> RECOVERY (left lane clear)", flush=True)
                         autonomy_state = "RECOVERY"
                         pid_state["is_post_overtake"] = False
@@ -655,14 +655,13 @@ def control_loop(car: JetRacer):
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
                 else:
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
-                    # Maneuver complete — check if obstacle is cleared before returning
-                    if not lidar_blocked:
-                        print("[STATE] -> FOLLOW (obstacle cleared)", flush=True)
-                        autonomy_state = "FOLLOW"
-                        pid_state["is_post_overtake"] = True
-                        pid_state["post_overtake_enc_dist"] = enc_dist
-                        yaw = 0.0
-                        pos_y = 0.0
+                    # Maneuver complete — go to FOLLOW unconditionally
+                    print(f"[STATE] -> FOLLOW (overtake done, enc_dist={enc_dist:.3f})", flush=True)
+                    autonomy_state = "FOLLOW"
+                    pid_state["is_post_overtake"] = True
+                    pid_state["post_overtake_enc_dist"] = enc_dist
+                    yaw = 0.0
+                    pos_y = 0.0
 
                 traj_error = target_y - pos_y
 
