@@ -607,7 +607,7 @@ def control_loop(car: JetRacer):
         # STATE MACHINE
         if s_copy["enabled"]:
             if autonomy_state == "FOLLOW":
-                if lidar_blocked:
+                if lidar_blocked and not pid_state.get("is_post_overtake", False):
                     autonomy_state = "OVERTAKING"
                     # Reset odometry NOW so pos_y is clean relative to maneuver start
                     yaw = 0.0
@@ -618,6 +618,20 @@ def control_loop(car: JetRacer):
                     pid_state["start_pos_y"] = 0.0
                     pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
                     print(f"[STATE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
+                elif pid_state.get("is_post_overtake", False):
+                    # Arrived here after OVERTAKING — wait 0.05m then check left lidar
+                    s_follow = enc_dist - pid_state.get("post_overtake_enc_dist", enc_dist)
+                    if s_follow >= 0.05 and lidar_closest_left > 400.0:
+                        print("[STATE] -> RECOVERY (left lane clear)", flush=True)
+                        autonomy_state = "RECOVERY"
+                        pid_state["is_post_overtake"] = False
+                        yaw = 0.0
+                        pos_y = 0.0
+                        pid_traj["integral"] = 0.0
+                        pid_traj["last_error"] = 0.0
+                        pid_state["start_enc_dist"] = enc_dist
+                        pid_state["start_pos_y"] = 0.0
+                        pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
                 car.steer(steer)
                 car.forward(s_copy["speed"])
 
@@ -645,8 +659,45 @@ def control_loop(car: JetRacer):
                     if not lidar_blocked:
                         print("[STATE] -> FOLLOW (obstacle cleared)", flush=True)
                         autonomy_state = "FOLLOW"
+                        pid_state["is_post_overtake"] = True
+                        pid_state["post_overtake_enc_dist"] = enc_dist
                         yaw = 0.0
                         pos_y = 0.0
+
+                traj_error = target_y - pos_y
+
+                pid_traj["integral"] += traj_error * dt
+                pid_traj["integral"] = max(-1.0, min(1.0, pid_traj["integral"]))
+                derivative = (traj_error - pid_traj["last_error"]) / dt
+                pid_traj["last_error"] = traj_error
+
+                steer_cmd = TRAJ_KP * traj_error + TRAJ_KI * pid_traj["integral"] + TRAJ_KD * derivative
+                steer_cmd = max(-1.0, min(1.0, steer_cmd))
+
+                car.steer(steer_cmd)
+                car.forward(s_copy["speed"])
+                steer = steer_cmd
+
+            elif autonomy_state == "RECOVERY":
+                # Mirror of OVERTAKING but flipped: returns car from left lane to right lane
+                s = enc_dist - pid_state.get("start_enc_dist", enc_dist)
+                D = pid_state.get("lane_change_dist", OVERTAKE_MANEUVER_DIST)
+
+                if s < D:
+                    s_ratio = s / D
+                    # 1. Standard ultra-smooth quintic
+                    poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
+                    # 2. Asymmetric kick
+                    kick = (s_ratio ** 0.5) * (1.0 - s_ratio)
+                    # 3. Blend
+                    poly = poly + 0.4 * kick
+                    target_y = pid_state.get("start_pos_y", 0.0) - LANE_WIDTH * poly
+                else:
+                    target_y = pid_state.get("start_pos_y", 0.0) - LANE_WIDTH
+                    print("[STATE] -> FOLLOW (recovery complete)", flush=True)
+                    autonomy_state = "FOLLOW"
+                    yaw = 0.0
+                    pos_y = 0.0
 
                 traj_error = target_y - pos_y
 
