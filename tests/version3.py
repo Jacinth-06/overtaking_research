@@ -535,7 +535,7 @@ def control_loop(car: JetRacer):
     last_time = time.time()
     pid_traj = {"integral": 0.0, "last_error": 0.0}
     # At top of control_loop, add dedicated trajectory PID gains
-    TRAJ_KP = 4   # Much higher — traj_error is in meters, not pixels
+    TRAJ_KP = 3.5   # Much higher — traj_error is in meters, not pixels
     TRAJ_KI = 0.1
     TRAJ_KD = 0.8
     LANE_WIDTH_ACTUAL = 0.28
