@@ -543,6 +543,9 @@ def control_loop(car: JetRacer):
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
     OVERTAKE_MANEUVER_DIST = 0.30  # meters of forward travel to complete lane change
     # 30cm is aggressive but realistic for 15cm wheelbase
+    # FIX: hard safety cap — if lidar_blocked never clears (sensor glitch, obstacle
+    # parked alongside), don't hold the lane-change PID forever. Force exit here.
+    OVERTAKE_MAX_DIST = OVERTAKE_MANEUVER_DIST * 2.5
     
     print("[loop] Control loop started")
 
@@ -655,13 +658,19 @@ def control_loop(car: JetRacer):
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
                 else:
                     target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
-                    # Maneuver complete — go to FOLLOW unconditionally
-                    print(f"[STATE] -> FOLLOW (overtake done, enc_dist={enc_dist:.3f})", flush=True)
-                    autonomy_state = "FOLLOW"
-                    pid_state["is_post_overtake"] = True
-                    pid_state["post_overtake_enc_dist"] = enc_dist
-                    yaw = 0.0
-                    pos_y = 0.0
+                    # FIX: don't exit unconditionally on distance — that was handing
+                    # control back to vision lane-centering (which just re-centers on
+                    # the same lane and erases the lateral offset) before the obstacle
+                    # was actually cleared. Hold here until lidar clears, same as the
+                    # working simple version — with a hard distance cap as a fallback
+                    # so we never get stuck here forever.
+                    if (not lidar_blocked) or (s >= OVERTAKE_MAX_DIST):
+                        print(f"[STATE] -> FOLLOW (overtake done, enc_dist={enc_dist:.3f})", flush=True)
+                        autonomy_state = "FOLLOW"
+                        pid_state["is_post_overtake"] = True
+                        pid_state["post_overtake_enc_dist"] = enc_dist
+                        yaw = 0.0
+                        pos_y = 0.0
 
                 traj_error = target_y - pos_y
 
@@ -717,6 +726,10 @@ def control_loop(car: JetRacer):
             autonomy_state = "FOLLOW"
             yaw = 0.0
             pos_y = 0.0
+            # FIX: clear stale post-overtake flag on disable so a half-finished
+            # overtake from a previous run doesn't block OVERTAKING from
+            # triggering on the next run.
+            pid_state["is_post_overtake"] = False
 
 
 
