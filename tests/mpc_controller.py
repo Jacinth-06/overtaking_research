@@ -386,34 +386,44 @@ class LaneChangeMPC:
 
     @staticmethod
     def _solve_pgd(H, f, lb, ub, A_ineq, b_ineq, x0,
-                   max_iter: int = 200, lr: float = 0.005,
-                   penalty_weight: float = 500.0):
+                   max_iter: int = 500,
+                   penalty_weight: float = 1000.0):
         """
-        Projected gradient descent with augmented Lagrangian for
-        inequality constraints.  Pure-numpy fallback when scipy is
-        not available.
+        Projected Gauss-Seidel (Coordinate Descent) fallback solver.
+        Extremely robust to ill-conditioned QPs compared to plain gradient descent.
+        Handles inequality constraints via an exact penalty method.
         """
         n = len(x0)
         x = x0.copy()
+        H_diag = np.diag(H)
 
-        # Use a simple penalty method for inequality constraints:
-        #   augmented cost += penalty_weight * Σ max(0, A_ineq @ x - b_ineq)²
-        for iteration in range(max_iter):
-            # Gradient of original QP
-            grad = H @ x + f
+        for _ in range(max_iter):
+            x_old = x.copy()
+            for i in range(n):
+                # 1. Base gradient & Hessian for coordinate i
+                grad_i = np.dot(H[i, :], x) + f[i]
+                hess_i = H_diag[i]
 
-            # Gradient of penalty for inequality violations
-            violation = A_ineq @ x - b_ineq          # (n_ineq,)
-            active = violation > 0                     # violated constraints
-            if np.any(active):
-                # ∂/∂x [ pw * Σ max(0, Ax-b)² ] = 2·pw · Aᵀ @ max(0, Ax-b)
-                grad += 2.0 * penalty_weight * (A_ineq.T @ (violation * active))
+                # 2. Augmented Lagrangian penalty for inequality violations
+                #    J_pen = pw * sum( max(0, A_ineq @ x - b_ineq)^2 )
+                violation = A_ineq @ x - b_ineq
+                active = violation > 0
+                if np.any(active):
+                    # Derivative of penalty w.r.t x_i
+                    grad_i += 2.0 * penalty_weight * np.dot(violation[active], A_ineq[active, i])
+                    # Second derivative (approximate Hessian for the penalty)
+                    hess_i += 2.0 * penalty_weight * np.sum(A_ineq[active, i]**2)
 
-            # Gradient step
-            x -= lr * grad
+                # 3. Gauss-Seidel update step
+                if hess_i > 1e-8:
+                    x[i] -= grad_i / hess_i
 
-            # Project onto box bounds
-            x = np.clip(x, lb, np.where(ub < 1e5, ub, x))
+                # 4. Project onto box bounds
+                x[i] = np.clip(x[i], lb[i], ub[i] if ub[i] < 1e5 else x[i])
+
+            # Early stopping if converged
+            if np.max(np.abs(x - x_old)) < 1e-4:
+                break
 
         return x
 
