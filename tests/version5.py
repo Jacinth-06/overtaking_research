@@ -556,7 +556,7 @@ def control_loop(car: JetRacer):
     mpc = LaneChangeMPC(
         Ts=0.05, P=30, M=10,
         L=0.15, delta_max_deg=25.0,
-        q_y=100.0, r_delta=1.0, r_v=10.0, rho=1000.0,
+        q_y=10.0, r_delta=50.0, r_v=10.0, rho=1000.0,
         v_min=0.05, v_max=0.30, y_margin=0.05,
     )
     mpc_prev_delta = 0.0          # previous steering angle (rad) for rate penalty
@@ -683,9 +683,11 @@ def control_loop(car: JetRacer):
                 # ── MPC solve (rate-limited to MPC_INTERVAL) ──────────────
                 if now - mpc_last_time >= MPC_INTERVAL:
                     z0 = np.array([pos_y, yaw])
+                    # Use mpc_speed_ref for the model v0 to prevent Bd from collapsing
+                    # if the encoder temporarily reads 0 due to wheel slip/noise.
                     delta_rad, v_cmd = mpc.solve(
                         z0, s, D, LANE_WIDTH, +1.0,
-                        max(enc_speed, 0.01), mpc_speed_ref, mpc_prev_delta
+                        mpc_speed_ref, mpc_speed_ref, mpc_prev_delta
                     )
                     mpc_prev_delta = delta_rad
                     mpc_last_delta = delta_rad
@@ -721,9 +723,10 @@ def control_loop(car: JetRacer):
                 # ── MPC solve (rate-limited to MPC_INTERVAL) ──────────────
                 if now - mpc_last_time >= MPC_INTERVAL:
                     z0 = np.array([pos_y, yaw])
+                    # Use mpc_speed_ref for stability
                     delta_rad, v_cmd = mpc.solve(
                         z0, s, D, LANE_WIDTH, -1.0,
-                        max(enc_speed, 0.01), mpc_speed_ref, mpc_prev_delta
+                        mpc_speed_ref, mpc_speed_ref, mpc_prev_delta
                     )
                     mpc_prev_delta = delta_rad
                     mpc_last_delta = delta_rad
