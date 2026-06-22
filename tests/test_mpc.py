@@ -25,7 +25,7 @@ def test_straight_line():
     # s_now > D means maneuver is done, reference = +LANE_WIDTH (a constant)
     # Instead, set D very large so reference stays near 0
     delta, v = mpc.solve(z0, s_now=0.0, D=100.0, lane_width=0.112,
-                         direction=+1.0, v0=0.08, v_ref=0.08, u_prev_delta=0.0)
+                         direction=+1.0, v0=0.25, v_ref=0.25, u_prev_delta=0.0)
     # At s=0, the quintic ref is 0, so MPC should barely steer
     assert abs(delta) < 0.05, f"Expected near-zero δ, got {math.degrees(delta):.2f}°"
     print(f"PASS  (δ = {math.degrees(delta):.3f}°, v = {v:.3f} m/s)")
@@ -35,13 +35,13 @@ def test_quintic_tracking():
     """Simulate MPC tracking the full quintic overtake trajectory."""
     print("TEST 2: Quintic tracking (overtake simulation) ... ", flush=True)
     mpc = LaneChangeMPC(
-        Ts=0.05, P=25, M=4, L=0.15, delta_max_deg=25.0,
+        Ts=0.05, P=30, M=10, L=0.15, delta_max_deg=25.0,
         q_y=100.0, r_delta=1.0, r_v=10.0, rho=1000.0,
         v_min=0.05, v_max=0.30,
     )
     LANE_WIDTH = 0.112
     D = 0.30
-    v0 = 0.08
+    v0 = 0.25
     dt = mpc.Ts
 
     y, theta, s = 0.0, 0.0, 0.0
@@ -50,7 +50,7 @@ def test_quintic_tracking():
 
     for step in range(100):
         z0 = np.array([y, theta])
-        delta_rad, v_cmd = mpc.solve(z0, s, D, LANE_WIDTH, +1.0, v0, 0.08, u_prev)
+        delta_rad, v_cmd = mpc.solve(z0, s, D, LANE_WIDTH, +1.0, v0, 0.25, u_prev)
         u_prev = delta_rad
         v0 = v_cmd
 
@@ -79,8 +79,8 @@ def test_recovery_direction():
     print("TEST 3: Recovery direction (-1) ... ", end="", flush=True)
     mpc = LaneChangeMPC()
     z0 = np.array([0.0, 0.0])
-    delta_pos, _ = mpc.solve(z0, 0.05, 0.30, 0.112, +1.0, 0.08, 0.08, 0.0)
-    delta_neg, _ = mpc.solve(z0, 0.05, 0.30, 0.112, -1.0, 0.08, 0.08, 0.0)
+    delta_pos, _ = mpc.solve(z0, 0.05, 0.30, 0.112, +1.0, 0.25, 0.25, 0.0)
+    delta_neg, _ = mpc.solve(z0, 0.05, 0.30, 0.112, -1.0, 0.25, 0.25, 0.0)
     # They should be opposite in sign
     assert delta_pos * delta_neg <= 0, (
         f"Expected opposite signs: +dir={math.degrees(delta_pos):.2f}°, "
@@ -97,7 +97,7 @@ def test_hard_constraints():
     for y0 in [-0.5, 0.0, 0.5]:
         for theta0 in [-0.3, 0.0, 0.3]:
             z0 = np.array([y0, theta0])
-            delta, v = mpc.solve(z0, 0.1, 0.30, 0.112, +1.0, 0.08, 0.08, 0.0)
+            delta, v = mpc.solve(z0, 0.1, 0.30, 0.112, +1.0, 0.25, 0.25, 0.0)
             assert abs(delta) <= mpc.delta_max + 1e-6, (
                 f"δ={math.degrees(delta):.2f}° exceeds limit {25}°")
             assert v >= mpc.v_min - 1e-6 and v <= mpc.v_max + 1e-6, (
@@ -114,7 +114,7 @@ def test_timing():
     times = []
     for _ in range(50):
         t0 = time.time()
-        mpc.solve(z0, 0.05, 0.30, 0.112, +1.0, 0.08, 0.08, 0.0)
+        mpc.solve(z0, 0.05, 0.30, 0.112, +1.0, 0.25, 0.25, 0.0)
         times.append((time.time() - t0) * 1000)
 
     avg = sum(times) / len(times)
@@ -131,8 +131,8 @@ def test_speed_control():
     print("TEST 6: Speed control ... ", end="", flush=True)
     mpc = LaneChangeMPC(r_v=50.0)  # higher weight on speed tracking
     z0 = np.array([0.0, 0.0])
-    v_ref = 0.12
-    _, v_cmd = mpc.solve(z0, 0.0, 100.0, 0.112, +1.0, 0.12, v_ref, 0.0)
+    v_ref = 0.25
+    _, v_cmd = mpc.solve(z0, 0.0, 100.0, 0.112, +1.0, 0.15, v_ref, 0.0)
     err = abs(v_cmd - v_ref)
     assert err < 0.05, f"Speed error {err:.3f} m/s > 50mm/s"
     print(f"PASS  (v_cmd={v_cmd:.3f}, v_ref={v_ref:.3f}, err={err*1000:.0f}mm/s)")

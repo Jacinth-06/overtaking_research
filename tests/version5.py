@@ -551,10 +551,10 @@ def control_loop(car: JetRacer):
     RECOVERY_POS_TOLERANCE = 0.03  # meters
 
     # ── MPC controller (replaces PID trajectory controller) ──────────────
-    #    Ts=0.05 (20 Hz), P=25 (1.25 s lookahead), M=4 (16% of P)
+    #    Ts=0.05 (20 Hz), P=30 (1.50 s lookahead), M=10 (33% of P)
     #    Wheelbase=0.15m, δ_max=25°
     mpc = LaneChangeMPC(
-        Ts=0.05, P=25, M=4,
+        Ts=0.05, P=30, M=10,
         L=0.15, delta_max_deg=25.0,
         q_y=100.0, r_delta=1.0, r_v=10.0, rho=1000.0,
         v_min=0.05, v_max=0.30, y_margin=0.05,
