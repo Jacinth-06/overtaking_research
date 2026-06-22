@@ -82,6 +82,7 @@ class LaneChangeMPC:
         v_min: float = 0.05,        # min speed  (m/s)
         v_max: float = 0.30,        # max speed  (m/s)
         y_margin: float = 0.05,     # soft output margin  (m)
+        max_iter: int = 15,        # max solver iterations
     ):
         self.Ts = Ts
         self.P = P
@@ -97,6 +98,7 @@ class LaneChangeMPC:
         self.v_min = v_min
         self.v_max = v_max
         self.y_margin = y_margin
+        self.max_iter = max_iter
 
         # Dimensions
         self.nx = 2        # [y, θ]
@@ -343,9 +345,9 @@ class LaneChangeMPC:
         x0[M:2*M] = np.clip(v_ref, self.v_min, self.v_max)
 
         if HAS_SCIPY:
-            x_opt = self._solve_scipy(H, f, lb, ub, A_ineq, b_ineq, x0)
+            x_opt = self._solve_scipy(H, f, lb, ub, A_ineq, b_ineq, x0, self.max_iter)
         else:
-            x_opt = self._solve_pgd(H, f, lb, ub, A_ineq, b_ineq, x0)
+            x_opt = self._solve_pgd(H, f, lb, ub, A_ineq, b_ineq, x0, self.max_iter)
 
         # ── Extract first commands ────────────────────────────────────────
         delta_opt = float(np.clip(x_opt[0], -self.delta_max, self.delta_max))
@@ -362,7 +364,7 @@ class LaneChangeMPC:
     #  Solvers
     # ──────────────────────────────────────────────────────────────────────
     @staticmethod
-    def _solve_scipy(H, f, lb, ub, A_ineq, b_ineq, x0):
+    def _solve_scipy(H, f, lb, ub, A_ineq, b_ineq, x0, max_iter):
         """Solve QP via scipy SLSQP."""
         bounds = list(zip(lb, ub))
 
@@ -380,8 +382,12 @@ class LaneChangeMPC:
             method='SLSQP',
             bounds=bounds,
             constraints=constraints,
-            options={'maxiter': 50, 'ftol': 1e-8, 'disp': False},
+            options={'maxiter': max_iter, 'ftol': 1e-2, 'disp': False},
         )
+        
+        if not result.success:
+            print(f"[MPC Warning] Suboptimal solution: {result.message} (iters: {result.nit})")
+            
         return result.x
 
     @staticmethod
