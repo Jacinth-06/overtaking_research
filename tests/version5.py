@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-version3.py — GPU-accelerated actual lane follower + Lidar safety stop + Flask dashboard
-Combines:  actual lane following (no offsets)
-           safety_stop.py     (lidar obstacle detection)
-Optimised for Jetson Nano 4 GB.
+version5.py — Lane follower + MPC overtaking/recovery + Lidar safety + Flask dashboard
+
+CHANGE from version3.py:
+  OVERTAKING and RECOVERY phases now use a Linear MPC controller instead of PID.
+  - Kinematic bicycle model (L=0.15m, δ_max=25°), linearised, discretised at 20 Hz
+  - Prediction horizon P=25 (1.25s), control horizon M=4 (16% of P)
+  - Two controlled inputs: steering angle δ (hard-constrained) and speed v (hard-constrained)
+  - Soft output constraints on lateral position y with slack penalty
+  - QP solved via scipy SLSQP (with numpy projected-gradient fallback)
+  - The FOLLOW state (vision lane-centering PID) is unchanged.
 
 Detection pipeline:
   frame → grayscale → Gaussian blur → (Canny + Binary threshold)
@@ -14,7 +20,7 @@ Safety layer:
   lidar front cone (320°–360° + 0°–40°) → if min distance < STOP_DISTANCE → override stop
   Lidar runs in its own background thread at ~20 Hz so it never blocks the camera loop.
 
-Run:   python version3.py
+Run:   python version5.py
 Open:  http://<jetson-ip>:5000
 """
 
@@ -28,6 +34,7 @@ import struct
 import requests
 import queue
 import math
+from mpc_controller import LaneChangeMPC
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, Response, render_template_string, request, jsonify
 
@@ -534,25 +541,32 @@ def control_loop(car: JetRacer):
     yaw = 0.0
     pos_y = 0.0
     last_time = time.time()
-    pid_traj = {"integral": 0.0, "last_error": 0.0}
-    # At top of control_loop, add dedicated trajectory PID gains
-    TRAJ_KP = 3.5   # Much higher — traj_error is in meters, not pixels
-    TRAJ_KI = 0.1
-    TRAJ_KD = 0.8
+
+    # ── Maneuver constants ────────────────────────────────────────────────
     LANE_WIDTH_ACTUAL = 0.28
-    LANE_WIDTH = LANE_WIDTH_ACTUAL*0.4   # meters to shift laterally
+    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.4   # meters to shift laterally
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
     OVERTAKE_MANEUVER_DIST = 0.30  # meters of forward travel to complete lane change
-    # 30cm is aggressive but realistic for 15cm wheelbase
-    # FIX: hard safety cap — if lidar_blocked never clears (sensor glitch, obstacle
-    # parked alongside), don't hold the lane-change PID forever. Force exit here.
-    # Shared by OVERTAKING and RECOVERY (same physical maneuver length scale).
     MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 2.5
-    # FIX: RECOVERY has no external sensor to gate on like OVERTAKING does
-    # (lidar_blocked) — it's a pure dead-reckoned maneuver. Exiting on distance
-    # alone let it bail before pos_y had actually caught up to target_y. Instead,
-    # require it to actually be close to the target lane position before exiting.
     RECOVERY_POS_TOLERANCE = 0.03  # meters
+
+    # ── MPC controller (replaces PID trajectory controller) ──────────────
+    #    Ts=0.05 (20 Hz), P=25 (1.25 s lookahead), M=4 (16% of P)
+    #    Wheelbase=0.15m, δ_max=25°
+    mpc = LaneChangeMPC(
+        Ts=0.05, P=25, M=4,
+        L=0.15, delta_max_deg=25.0,
+        q_y=100.0, r_delta=1.0, r_v=10.0, rho=1000.0,
+        v_min=0.05, v_max=0.30, y_margin=0.05,
+    )
+    mpc_prev_delta = 0.0          # previous steering angle (rad) for rate penalty
+    mpc_throttle_ref = 0.0        # throttle at maneuver start (for v↔throttle mapping)
+    mpc_speed_ref = 0.0           # enc_speed at maneuver start (m/s)
+    mpc_solve_ms = 0.0            # last MPC solve time (ms)
+    MPC_INTERVAL = mpc.Ts         # run MPC at its design rate (20 Hz)
+    mpc_last_time = 0.0           # time of last MPC solve
+    mpc_last_delta = 0.0          # held steering between MPC calls
+    mpc_last_v = 0.0              # held speed between MPC calls
     
     print("[loop] Control loop started")
 
@@ -619,28 +633,35 @@ def control_loop(car: JetRacer):
             if autonomy_state == "FOLLOW":
                 if lidar_blocked and not pid_state.get("is_post_overtake", False):
                     autonomy_state = "OVERTAKING"
-                    # Reset odometry NOW so pos_y is clean relative to maneuver start
+                    # Reset odometry for MPC state
                     yaw = 0.0
                     pos_y = 0.0
-                    pid_traj["integral"] = 0.0
-                    pid_traj["last_error"] = 0.0
+                    mpc_prev_delta = 0.0
+                    mpc_last_delta = 0.0
+                    mpc_last_v = max(enc_speed, 0.01)
+                    mpc_last_time = 0.0
+                    # Record throttle↔speed mapping at maneuver start
+                    mpc_throttle_ref = s_copy["speed"]
+                    mpc_speed_ref = max(enc_speed, 0.01)
                     pid_state["start_enc_dist"] = enc_dist
-                    pid_state["start_pos_y"] = 0.0
                     pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
-                    print(f"[STATE] -> OVERTAKING. Obstacle at {lidar_closest}mm", flush=True)
+                    print(f"[STATE] -> OVERTAKING (MPC). Obstacle at {lidar_closest}mm", flush=True)
                 elif pid_state.get("is_post_overtake", False):
                     # Arrived here after OVERTAKING — wait 0.4m then check left lidar
                     s_follow = enc_dist - pid_state.get("post_overtake_enc_dist", enc_dist)
                     if s_follow >= 0.4 and lidar_closest_left > 400.0:
-                        print("[STATE] -> RECOVERY (left lane clear)", flush=True)
+                        print("[STATE] -> RECOVERY (MPC, left lane clear)", flush=True)
                         autonomy_state = "RECOVERY"
                         pid_state["is_post_overtake"] = False
                         yaw = 0.0
                         pos_y = 0.0
-                        pid_traj["integral"] = 0.0
-                        pid_traj["last_error"] = 0.0
+                        mpc_prev_delta = 0.0
+                        mpc_last_delta = 0.0
+                        mpc_last_v = max(enc_speed, 0.01)
+                        mpc_last_time = 0.0
+                        mpc_throttle_ref = s_copy["speed"]
+                        mpc_speed_ref = max(enc_speed, 0.01)
                         pid_state["start_enc_dist"] = enc_dist
-                        pid_state["start_pos_y"] = 0.0
                         pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
                 car.steer(steer)
                 car.forward(s_copy["speed"])
@@ -649,28 +670,8 @@ def control_loop(car: JetRacer):
                 s = enc_dist - pid_state.get("start_enc_dist", enc_dist)
                 D = pid_state.get("lane_change_dist", OVERTAKE_MANEUVER_DIST)
 
-                if s < D:
-                    s_ratio = s / D
-    
-        # 1. Standard ultra-smooth quintic
-                    poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
-    
-    # 2. Asymmetric kick: Strong at 0, decays to 0 at 1
-    # (1 - s_ratio) ensures the kick is completely gone by the end
-                    kick = (s_ratio ** 0.5) * (1.0 - s_ratio)
-    
-    # 3. Blend them (adjust 0.4 to increase/decrease the initial kick)
-                    poly = poly + 0.4 * kick
-    
-                    target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH * poly
-                else:
-                    target_y = pid_state.get("start_pos_y", 0.0) + LANE_WIDTH
-                    # FIX: don't exit unconditionally on distance — that was handing
-                    # control back to vision lane-centering (which just re-centers on
-                    # the same lane and erases the lateral offset) before the obstacle
-                    # was actually cleared. Hold here until lidar clears, same as the
-                    # working simple version — with a hard distance cap as a fallback
-                    # so we never get stuck here forever.
+                # Check maneuver exit conditions
+                if s >= D:
                     if (not lidar_blocked) or (s >= MANEUVER_MAX_DIST):
                         print(f"[STATE] -> FOLLOW (overtake done, enc_dist={enc_dist:.3f})", flush=True)
                         autonomy_state = "FOLLOW"
@@ -679,61 +680,65 @@ def control_loop(car: JetRacer):
                         yaw = 0.0
                         pos_y = 0.0
 
-                traj_error = target_y - pos_y
+                # ── MPC solve (rate-limited to MPC_INTERVAL) ──────────────
+                if now - mpc_last_time >= MPC_INTERVAL:
+                    z0 = np.array([pos_y, yaw])
+                    delta_rad, v_cmd = mpc.solve(
+                        z0, s, D, LANE_WIDTH, +1.0,
+                        max(enc_speed, 0.01), mpc_speed_ref, mpc_prev_delta
+                    )
+                    mpc_prev_delta = delta_rad
+                    mpc_last_delta = delta_rad
+                    mpc_last_v = v_cmd
+                    mpc_last_time = now
+                    mpc_solve_ms = mpc.last_solve_ms
 
-                pid_traj["integral"] += traj_error * dt
-                pid_traj["integral"] = max(-1.0, min(1.0, pid_traj["integral"]))
-                derivative = (traj_error - pid_traj["last_error"]) / dt
-                pid_traj["last_error"] = traj_error
-
-                steer_cmd = TRAJ_KP * traj_error + TRAJ_KI * pid_traj["integral"] + TRAJ_KD * derivative
+                # Convert MPC outputs to car commands
+                steer_cmd = mpc_last_delta / mpc.delta_max
                 steer_cmd = max(-1.0, min(1.0, steer_cmd))
+                # Speed: scale throttle proportionally to MPC speed command
+                throttle_cmd = mpc_throttle_ref * (mpc_last_v / mpc_speed_ref)
+                throttle_cmd = max(0.0, min(0.60, throttle_cmd))
 
                 car.steer(steer_cmd)
-                car.forward(s_copy["speed"])
+                car.forward(throttle_cmd)
                 steer = steer_cmd
 
             elif autonomy_state == "RECOVERY":
-                # Mirror of OVERTAKING but flipped: returns car from left lane to right lane
+                # Mirror of OVERTAKING but direction=-1 (shift right)
                 s = enc_dist - pid_state.get("start_enc_dist", enc_dist)
                 D = pid_state.get("lane_change_dist", OVERTAKE_MANEUVER_DIST)
 
-                if s < D:
-                    s_ratio = s / D
-                    # 1. Standard ultra-smooth quintic
-                    poly = 10*(s_ratio)**3 - 15*(s_ratio)**4 + 6*(s_ratio)**5
-                    # 2. Asymmetric kick
-                    kick = (s_ratio ** 0.5) * (1.0 - s_ratio)
-                    # 3. Blend
-                    poly = poly + 0.4 * kick
-                    target_y = pid_state.get("start_pos_y", 0.0) - LANE_WIDTH * poly
-                else:
-                    target_y = pid_state.get("start_pos_y", 0.0) - LANE_WIDTH
-
-                traj_error = target_y - pos_y
-
-                # FIX: don't exit purely on distance — only declare recovery
-                # complete once pos_y has actually caught up to target_y (or
-                # we hit the hard safety cap). This was the bug: it used to
-                # flip back to FOLLOW the instant s>=D even if the PID hadn't
-                # converged yet, so the car never actually got back to the
-                # original lane before reverting to plain lane-centering.
+                # Check recovery exit: pos_y close to target OR hard distance cap
+                target_y_final = -LANE_WIDTH
+                traj_error = target_y_final - pos_y
                 if s >= D and (abs(traj_error) < RECOVERY_POS_TOLERANCE or s >= MANEUVER_MAX_DIST):
                     print("[STATE] -> FOLLOW (recovery complete)", flush=True)
                     autonomy_state = "FOLLOW"
                     yaw = 0.0
                     pos_y = 0.0
 
-                pid_traj["integral"] += traj_error * dt
-                pid_traj["integral"] = max(-1.0, min(1.0, pid_traj["integral"]))
-                derivative = (traj_error - pid_traj["last_error"]) / dt
-                pid_traj["last_error"] = traj_error
+                # ── MPC solve (rate-limited to MPC_INTERVAL) ──────────────
+                if now - mpc_last_time >= MPC_INTERVAL:
+                    z0 = np.array([pos_y, yaw])
+                    delta_rad, v_cmd = mpc.solve(
+                        z0, s, D, LANE_WIDTH, -1.0,
+                        max(enc_speed, 0.01), mpc_speed_ref, mpc_prev_delta
+                    )
+                    mpc_prev_delta = delta_rad
+                    mpc_last_delta = delta_rad
+                    mpc_last_v = v_cmd
+                    mpc_last_time = now
+                    mpc_solve_ms = mpc.last_solve_ms
 
-                steer_cmd = TRAJ_KP * traj_error + TRAJ_KI * pid_traj["integral"] + TRAJ_KD * derivative
+                # Convert MPC outputs to car commands
+                steer_cmd = mpc_last_delta / mpc.delta_max
                 steer_cmd = max(-1.0, min(1.0, steer_cmd))
+                throttle_cmd = mpc_throttle_ref * (mpc_last_v / mpc_speed_ref)
+                throttle_cmd = max(0.0, min(0.60, throttle_cmd))
 
                 car.steer(steer_cmd)
-                car.forward(s_copy["speed"])
+                car.forward(throttle_cmd)
                 steer = steer_cmd
 
         else:
@@ -785,7 +790,12 @@ def control_loop(car: JetRacer):
                 "autonomy_state": autonomy_state,
                 "crossing_phase": pid_state.get("crossing_phase", 1),
                 "integral": round(pid_state.get("integral", 0.0), 4),
-                "nominal_lane_width": round(pid_state.get("nominal_lane_width", 0.0), 2)
+                "nominal_lane_width": round(pid_state.get("nominal_lane_width", 0.0), 2),
+                "mpc_solve_ms": round(mpc_solve_ms, 2),
+                "mpc_delta_deg": round(math.degrees(mpc_prev_delta), 2),
+                "mpc_v_cmd": round(mpc_last_v, 4),
+                "pos_y": round(pos_y, 5),
+                "yaw_deg": round(math.degrees(yaw), 2)
             }
             for k, v in s_copy.items():
                 if k not in ["is_testing", "test_id"]:
