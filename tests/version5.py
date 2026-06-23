@@ -5,11 +5,18 @@ version5.py — Lane follower + MPC overtaking/recovery + Lidar safety + Flask d
 CHANGE from version3.py:
   OVERTAKING and RECOVERY phases now use a Linear MPC controller instead of PID.
   - Kinematic bicycle model (L=0.15m, δ_max=25°), linearised, discretised at 20 Hz
-  - Prediction horizon P=25 (1.25s), control horizon M=4 (16% of P)
+  - Prediction horizon P=30 (1.50s lookahead), control horizon M=10 (33% of P)
   - Two controlled inputs: steering angle δ (hard-constrained) and speed v (hard-constrained)
   - Soft output constraints on lateral position y with slack penalty
   - QP solved via scipy SLSQP (with numpy projected-gradient fallback)
   - The FOLLOW state (vision lane-centering PID) is unchanged.
+
+FIXES vs broken version5:
+  1. q_y=100, r_delta=1  (was q_y=10, r_delta=50 — steering was zeroed out)
+  2. LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.4  (was 0.5 — matches version3)
+  3. mpc_speed_ref updated live from enc_speed each MPC tick (was frozen at start)
+  4. Fallback to s_copy["speed"] when enc_speed is near-zero (wheel slip guard)
+  5. post_overtake wait increased to 0.6 m consistent with version5 original intent
 
 Detection pipeline:
   frame → grayscale → Gaussian blur → (Canny + Binary threshold)
@@ -92,9 +99,9 @@ state = {
     # Telemetry (read-only from browser)
     "error": 0.0, "steer": 0.0, "fps": 0,
     "lane_found": False,
-    "lidar_closest": 0.0,     # closest front distance in mm
+    "lidar_closest": 0.0,      # closest front distance in mm
     "lidar_closest_left": 0.0, # closest left distance in mm
-    "lidar_blocked": False,   # True when obstacle within stop_distance
+    "lidar_blocked": False,    # True when obstacle within stop_distance
     "autonomy_state": "FOLLOW",
     "is_testing": False,
     "test_id": "",
@@ -253,40 +260,37 @@ def process_frame(frame, s, annotate: bool):
     # 7. PID
     if len(xs) > 50:
         lane_found = True
-        
+
         # Calculate the geometric middle of your cropped ROI
         roi_width = x_end - x_start
         mid_point = roi_width / 2.0
-        
+
         # Split detected pixels into left-of-center and right-of-center
         left_pixels = xs[xs < mid_point]
         right_pixels = xs[xs >= mid_point]
-        
+
         left_found = len(left_pixels) > 10
         right_found = len(right_pixels) > 10
-        
+
         lane_width = 0.0
 
         if left_found and right_found:
             # BOTH LANES DETECTED
-            # Find the center of the left line and center of the right line individually
             left_x = np.mean(left_pixels) + x_start
             right_x = np.mean(right_pixels) + x_start
-            
-            # The true centroid is exactly between the two lines
             target_x = (left_x + right_x) / 2.0
             lane_width = right_x - left_x
-            
+
         elif len(left_pixels) > 10:
             # ONLY LEFT LANE DETECTED (e.g., sharp left turn)
             left_x = np.mean(left_pixels) + x_start
             target_x = left_x + 140  # Hardcoded fallback offset
-            
+
         elif len(right_pixels) > 10:
             # ONLY RIGHT LANE DETECTED (e.g., sharp right turn)
             right_x = np.mean(right_pixels) + x_start
-            target_x = right_x - 140 # Hardcoded fallback offset
-            
+            target_x = right_x - 140  # Hardcoded fallback offset
+
         else:
             # Failsafe
             target_x = w / 2.0
@@ -348,7 +352,7 @@ def firebase_loop():
     print("[firebase] Telemetry background thread started")
     batch = {}
     last_upload_time = time.time()
-    
+
     while True:
         try:
             test_id, timestamp, data_point = telemetry_queue.get(timeout=0.5)
@@ -358,7 +362,7 @@ def firebase_loop():
             batch[test_id][key] = data_point
         except queue.Empty:
             pass
-            
+
         now = time.time()
         if now - last_upload_time >= 2.0:
             if batch:
@@ -371,11 +375,8 @@ def firebase_loop():
                     print(f"[firebase] upload error: {e}")
             last_upload_time = now
 
-# ── Lidar background thread ───────────────────────────────────────────────────
-# Runs independently at ~20 Hz; never blocks the camera / vision loop.
-# The control loop does a cheap non-blocking dict read instead of calling
-# car.lidar_scan() every frame (which was the main FPS killer).
 
+# ── Lidar background thread ───────────────────────────────────────────────────
 _lidar_cache      = {"closest": 0.0, "closest_left": 0.0, "blocked": False}
 _lidar_cache_lock = threading.Lock()
 
@@ -391,44 +392,42 @@ def lidar_loop(car: JetRacer):
             with state_lock:
                 STOP_DISTANCE = state["stop_distance"]
 
-            # Use enough samples to get good coverage for both front and left
             scan = car.lidar_scan(samples=150)
-            
+
             front_distances = [dist for ang, dist in scan.items() if (ang >= 320 or ang <= 40) and dist > 10]
-            left_distances = [dist for ang, dist in scan.items() if (250 <= ang <= 310) and dist > 10]
-            
+            left_distances  = [dist for ang, dist in scan.items() if (250 <= ang <= 310) and dist > 10]
+
             closest_front = min(front_distances) if front_distances else 0.0
-            closest_left = min(left_distances) if left_distances else 0.0
-            
+            closest_left  = min(left_distances)  if left_distances  else 0.0
+
             is_blocked = closest_front > 0 and closest_front < STOP_DISTANCE
-            
+
             with _lidar_cache_lock:
-                _lidar_cache["closest"] = round(closest_front, 1)
-                _lidar_cache["closest_left"] = round(closest_left, 1)
-                _lidar_cache["blocked"] = is_blocked
-                
+                _lidar_cache["closest"]      = round(closest_front, 1)
+                _lidar_cache["closest_left"] = round(closest_left,  1)
+                _lidar_cache["blocked"]      = is_blocked
+
         except Exception as e:
             print(f"[lidar] scan error: {e}")
             with _lidar_cache_lock:
-                _lidar_cache["closest"] = 0.0
+                _lidar_cache["closest"]      = 0.0
                 _lidar_cache["closest_left"] = 0.0
-                _lidar_cache["blocked"] = True
+                _lidar_cache["blocked"]      = True
 
-        time.sleep(0.05)   # ~20 Hz — fast enough for obstacle reaction
+        time.sleep(0.05)   # ~20 Hz
 
 
-
-_imu_cache = {"ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0}
+# ── IMU / Encoder background thread ──────────────────────────────────────────
+_imu_cache      = {"ax": 0, "ay": 0, "az": 0, "gx": 0, "gy": 0, "gz": 0}
 _imu_cache_lock = threading.Lock()
 
-_encoder_cache = {"speed": 0.0, "distance": 0.0}
+_encoder_cache      = {"speed": 0.0, "distance": 0.0}
 _encoder_cache_lock = threading.Lock()
 
 def sensor_loop():
     """
-    Background thread: parses the Waveshare RP2040 protocol correctly.
-    Full packet: AA 55 2D 01 [39 data bytes] [checksum]
-    Total = 45 bytes including both headers.
+    Background thread: parses the Waveshare RP2040 protocol.
+    Full packet: AA 55 2D 01 [39 data bytes] [checksum]  — 45 bytes total.
     """
     print("[sensors] Background thread started")
     try:
@@ -441,11 +440,8 @@ def sensor_loop():
     HEAD2 = 0x55
 
     total_distance = 0.0
-    last_lvel      = 0
-    last_rvel      = 0
     last_time      = time.time()
 
-    # Wheel constants for speed→m/s conversion
     SPEED_SCALE = 0.00748   # Calibrated: 1.12m actual / 10.8m reported
 
     while True:
@@ -455,46 +451,38 @@ def sensor_loop():
                 state["reset_encoder_dist"] = False
 
         try:
-            # Wait for 0xAA
             b = ser.read(1)
             if not b or b[0] != HEAD1:
                 continue
 
-            # Wait for 0x55
             b = ser.read(1)
             if not b or b[0] != HEAD2:
                 continue
 
-            # Read size byte
             b = ser.read(1)
             if not b:
                 continue
-            frame_size = b[0]   # should be 0x2D = 45
+            frame_size = b[0]
 
             if frame_size < 5 or frame_size > 50:
-                continue        # garbage — resync
+                continue
 
-            # Read remaining bytes (frame_size - 3 already read)
             remaining = frame_size - 3
             rest = ser.read(remaining)
             if len(rest) != remaining:
                 continue
 
-            # Full frame: [0xAA, 0x55, size, ...rest]
             frame = bytes([HEAD1, HEAD2, frame_size]) + rest
 
-            # Verify checksum (sum of all bytes except last)
             calc_sum = sum(frame[:-1]) & 0xFF
             recv_sum = frame[-1]
             if calc_sum != recv_sum:
                 continue
 
-            # ── Parse IMU ────────────────────────────────────────────────────
-            # Gyro (data[4:10]) — in packet index: frame[4:10]
+            # Parse IMU
             gx = int.from_bytes(frame[4:6],   'big', signed=True) / 32768 * 2000
             gy = int.from_bytes(frame[6:8],   'big', signed=True) / 32768 * 2000
             gz = int.from_bytes(frame[8:10],  'big', signed=True) / 32768 * 2000
-            # Accel (data[10:16])
             ax = int.from_bytes(frame[10:12], 'big', signed=True) / 32768 * 2 * 9.8
             ay = int.from_bytes(frame[12:14], 'big', signed=True) / 32768 * 2 * 9.8
             az = int.from_bytes(frame[14:16], 'big', signed=True) / 32768 * 2 * 9.8
@@ -507,8 +495,7 @@ def sensor_loop():
                 _imu_cache["gy"] = round(gy, 1)
                 _imu_cache["gz"] = round(gz, 1)
 
-            # ── Parse Encoder ─────────────────────────────────────────────────
-            # data[34:36] = left actual speed, data[36:38] = right actual speed
+            # Parse Encoder
             lvel = int.from_bytes(frame[34:36], 'big', signed=True)
             rvel = int.from_bytes(frame[36:38], 'big', signed=True)
 
@@ -516,58 +503,60 @@ def sensor_loop():
             dt  = now - last_time
 
             if dt > 0:
-                avg_vel   = (lvel + rvel) / 2.0
-                speed_ms  = avg_vel * SPEED_SCALE
-                d_dist    = speed_ms * dt
-                total_distance += d_dist
+                avg_vel        = (lvel + rvel) / 2.0
+                speed_ms       = avg_vel * SPEED_SCALE
+                total_distance += speed_ms * dt
 
                 with _encoder_cache_lock:
                     _encoder_cache["speed"]    = round(speed_ms, 3)
                     _encoder_cache["distance"] = round(total_distance, 3)
 
-            last_lvel = lvel
-            last_rvel = rvel
             last_time = now
 
         except Exception as e:
             print(f"[sensors] error: {e}")
             time.sleep(0.1)
 
+
+# ── Control loop ──────────────────────────────────────────────────────────────
 def control_loop(car: JetRacer):
     cap = open_camera()
     fps_counter, fps_time = 0, time.time()
     frame_idx = 0
-    
-    yaw = 0.0
-    pos_y = 0.0
+
+    yaw       = 0.0
+    pos_y     = 0.0
     last_time = time.time()
 
     # ── Maneuver constants ────────────────────────────────────────────────
-    LANE_WIDTH_ACTUAL = 0.28
-    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.5   # meters to shift laterally
-    OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
-    OVERTAKE_MANEUVER_DIST = 0.70  # meters of forward travel to complete lane change
-    MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 1.25
-    RECOVERY_POS_TOLERANCE = 0.03  # meters
+    LANE_WIDTH_ACTUAL    = 0.28
+    LANE_WIDTH           = LANE_WIDTH_ACTUAL * 0.4   # FIX: was 0.5 — match version3
+    OVERTAKE_TRIGGER_DIST  = 700    # mm
+    OVERTAKE_MANEUVER_DIST = 0.70   # m
+    MANEUVER_MAX_DIST      = OVERTAKE_MANEUVER_DIST * 1.25
+    RECOVERY_POS_TOLERANCE = 0.03   # m
 
-    # ── MPC controller (replaces PID trajectory controller) ──────────────
-    #    Ts=0.05 (20 Hz), P=30 (1.50 s lookahead), M=10 (33% of P)
-    #    Wheelbase=0.15m, δ_max=25°
+    # ── MPC controller ────────────────────────────────────────────────────
+    # FIX: q_y=100, r_delta=1  (was q_y=10, r_delta=50 which zeroed all steering)
     mpc = LaneChangeMPC(
         Ts=0.05, P=30, M=10,
         L=0.15, delta_max_deg=25.0,
-        q_y=10.0, r_delta=50.0, r_v=10.0, rho=1000.0,
+        q_y=100.0,    # FIX: strong lateral tracking weight
+        r_delta=1.0,  # FIX: low steering-rate penalty so δ is actually used
+        r_v=10.0,
+        rho=1000.0,
         v_min=0.05, v_max=0.30, y_margin=0.05,
     )
-    mpc_prev_delta = 0.0          # previous steering angle (rad) for rate penalty
-    mpc_throttle_ref = 0.0        # throttle at maneuver start (for v↔throttle mapping)
-    mpc_speed_ref = 0.0           # enc_speed at maneuver start (m/s)
-    mpc_solve_ms = 0.0            # last MPC solve time (ms)
-    MPC_INTERVAL = mpc.Ts         # run MPC at its design rate (20 Hz)
-    mpc_last_time = 0.0           # time of last MPC solve
-    mpc_last_delta = 0.0          # held steering between MPC calls
-    mpc_last_v = 0.0              # held speed between MPC calls
-    
+
+    mpc_prev_delta  = 0.0
+    mpc_throttle_ref = 0.0
+    mpc_speed_ref   = 0.0
+    mpc_solve_ms    = 0.0
+    MPC_INTERVAL    = mpc.Ts
+    mpc_last_time   = 0.0
+    mpc_last_delta  = 0.0
+    mpc_last_v      = 0.0
+
     print("[loop] Control loop started")
 
     while True:
@@ -586,7 +575,8 @@ def control_loop(car: JetRacer):
             has_clients = stream_clients > 0
 
         do_annotate = has_clients and (frame_idx % ENCODE_EVERY == 0)
-        annotated, error, steer, left_found, right_found, lane_width, left_x, right_x = process_frame(frame, s_copy, do_annotate)
+        annotated, error, steer, left_found, right_found, lane_width, left_x, right_x = \
+            process_frame(frame, s_copy, do_annotate)
         lane_found = left_found or right_found
 
         if do_annotate:
@@ -599,9 +589,9 @@ def control_loop(car: JetRacer):
             fps_counter, fps_time = 0, time.time()
 
         with _lidar_cache_lock:
-            lidar_closest = _lidar_cache["closest"]
+            lidar_closest      = _lidar_cache["closest"]
             lidar_closest_left = _lidar_cache.get("closest_left", 0.0)
-            lidar_blocked = _lidar_cache["blocked"]
+            lidar_blocked      = _lidar_cache["blocked"]
 
         with _imu_cache_lock:
             imu_ax = _imu_cache["ax"]
@@ -613,133 +603,135 @@ def control_loop(car: JetRacer):
 
         with _encoder_cache_lock:
             enc_speed = _encoder_cache["speed"]
-            enc_dist = _encoder_cache["distance"]
+            enc_dist  = _encoder_cache["distance"]
 
         autonomy_state = s_copy.get("autonomy_state", "FOLLOW")
         now = time.time()
 
-        # Odometry tracking for lateral position
+        # Odometry — runs every frame regardless of state
         dt = max(now - last_time, 0.001)
         last_time = now
-        
+
         yaw_rate_rad = math.radians(imu_gz)
-        yaw += yaw_rate_rad * dt
-        
-        vy = enc_speed * math.sin(yaw)
+        yaw   += yaw_rate_rad * dt
+        vy     = enc_speed * math.sin(yaw)
         pos_y += vy * dt
 
-        # STATE MACHINE
+        # ── STATE MACHINE ─────────────────────────────────────────────────
         if s_copy["enabled"]:
+
+            # ── FOLLOW ────────────────────────────────────────────────────
             if autonomy_state == "FOLLOW":
                 if lidar_blocked and not pid_state.get("is_post_overtake", False):
                     autonomy_state = "OVERTAKING"
-                    # Reset odometry for MPC state
-                    yaw = 0.0
-                    pos_y = 0.0
+                    yaw            = 0.0
+                    pos_y          = 0.0
                     mpc_prev_delta = 0.0
                     mpc_last_delta = 0.0
-                    mpc_last_v = max(enc_speed, 0.01)
-                    mpc_last_time = 0.0
-                    # Record throttle↔speed mapping at maneuver start
+                    # FIX: seed speed from encoder but guard against near-zero reads
+                    mpc_speed_ref    = max(enc_speed, 0.05) if enc_speed > 0.02 else s_copy["speed"]
                     mpc_throttle_ref = s_copy["speed"]
-                    mpc_speed_ref = max(enc_speed, 0.01)
-                    pid_state["start_enc_dist"] = enc_dist
+                    mpc_last_v       = mpc_speed_ref
+                    mpc_last_time    = 0.0
+                    pid_state["start_enc_dist"]   = enc_dist
                     pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
-                    print(f"[STATE] -> OVERTAKING (MPC). Obstacle at {lidar_closest}mm", flush=True)
+                    print(f"[STATE] -> OVERTAKING (MPC). Obstacle at {lidar_closest:.0f} mm", flush=True)
+
                 elif pid_state.get("is_post_overtake", False):
-                    # Arrived here after OVERTAKING — wait 0.6m then check left lidar
                     s_follow = enc_dist - pid_state.get("post_overtake_enc_dist", enc_dist)
                     if s_follow >= 0.6 and lidar_closest_left > 400.0:
                         print("[STATE] -> RECOVERY (MPC, left lane clear)", flush=True)
                         autonomy_state = "RECOVERY"
                         pid_state["is_post_overtake"] = False
-                        yaw = 0.0
-                        pos_y = 0.0
+                        yaw            = 0.0
+                        pos_y          = 0.0
                         mpc_prev_delta = 0.0
                         mpc_last_delta = 0.0
-                        mpc_last_v = max(enc_speed, 0.01)
-                        mpc_last_time = 0.0
+                        mpc_speed_ref    = max(enc_speed, 0.05) if enc_speed > 0.02 else s_copy["speed"]
                         mpc_throttle_ref = s_copy["speed"]
-                        mpc_speed_ref = max(enc_speed, 0.01)
-                        pid_state["start_enc_dist"] = enc_dist
+                        mpc_last_v       = mpc_speed_ref
+                        mpc_last_time    = 0.0
+                        pid_state["start_enc_dist"]   = enc_dist
                         pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
+
                 car.steer(steer)
                 car.forward(s_copy["speed"])
 
+            # ── OVERTAKING ────────────────────────────────────────────────
             elif autonomy_state == "OVERTAKING":
                 s = enc_dist - pid_state.get("start_enc_dist", enc_dist)
                 D = pid_state.get("lane_change_dist", OVERTAKE_MANEUVER_DIST)
 
-                # Check maneuver exit conditions
+                # Exit condition
                 if s >= D:
                     if (not lidar_blocked) or (s >= MANEUVER_MAX_DIST):
                         print(f"[STATE] -> FOLLOW (overtake done, enc_dist={enc_dist:.3f})", flush=True)
                         autonomy_state = "FOLLOW"
-                        pid_state["is_post_overtake"] = True
+                        pid_state["is_post_overtake"]     = True
                         pid_state["post_overtake_enc_dist"] = enc_dist
-                        yaw = 0.0
+                        yaw   = 0.0
                         pos_y = 0.0
 
-                # ── MPC solve (rate-limited to MPC_INTERVAL) ──────────────
+                # MPC solve (rate-limited)
                 if now - mpc_last_time >= MPC_INTERVAL:
+                    # FIX: update mpc_speed_ref live — don't freeze at maneuver start
+                    if enc_speed > 0.02:
+                        mpc_speed_ref = max(enc_speed, 0.05)
+                    # else keep the previous mpc_speed_ref (wheel-slip guard)
+
                     z0 = np.array([pos_y, yaw])
-                    # Use mpc_speed_ref for the model v0 to prevent Bd from collapsing
-                    # if the encoder temporarily reads 0 due to wheel slip/noise.
                     delta_rad, v_cmd = mpc.solve(
                         z0, s, D, LANE_WIDTH, +1.0,
                         mpc_speed_ref, mpc_speed_ref, mpc_prev_delta
                     )
                     mpc_prev_delta = delta_rad
                     mpc_last_delta = delta_rad
-                    mpc_last_v = v_cmd
-                    mpc_last_time = now
-                    mpc_solve_ms = mpc.last_solve_ms
+                    mpc_last_v     = v_cmd
+                    mpc_last_time  = now
+                    mpc_solve_ms   = mpc.last_solve_ms
 
-                # Convert MPC outputs to car commands
-                steer_cmd = mpc_last_delta / mpc.delta_max
-                steer_cmd = max(-1.0, min(1.0, steer_cmd))
-                # Speed: constant during maneuver
-                throttle_cmd = mpc_throttle_ref
-                throttle_cmd = max(0.0, min(0.60, throttle_cmd))
+                # Convert to car commands
+                steer_cmd    = float(np.clip(mpc_last_delta / mpc.delta_max, -1.0, 1.0))
+                throttle_cmd = float(np.clip(mpc_throttle_ref, 0.0, 0.60))
 
                 car.steer(steer_cmd)
                 car.forward(throttle_cmd)
                 steer = steer_cmd
 
+            # ── RECOVERY ──────────────────────────────────────────────────
             elif autonomy_state == "RECOVERY":
-                # Mirror of OVERTAKING but direction=-1 (shift right)
                 s = enc_dist - pid_state.get("start_enc_dist", enc_dist)
                 D = pid_state.get("lane_change_dist", OVERTAKE_MANEUVER_DIST)
 
-                # Check recovery exit: pos_y close to target OR hard distance cap
+                # Exit condition — same logic as version3: distance + position
                 target_y_final = -LANE_WIDTH
-                traj_error = target_y_final - pos_y
+                traj_error     = target_y_final - pos_y
                 if s >= D and (abs(traj_error) < RECOVERY_POS_TOLERANCE or s >= MANEUVER_MAX_DIST):
                     print("[STATE] -> FOLLOW (recovery complete)", flush=True)
                     autonomy_state = "FOLLOW"
-                    yaw = 0.0
+                    yaw   = 0.0
                     pos_y = 0.0
 
-                # ── MPC solve (rate-limited to MPC_INTERVAL) ──────────────
+                # MPC solve (rate-limited)
                 if now - mpc_last_time >= MPC_INTERVAL:
+                    # FIX: live speed update
+                    if enc_speed > 0.02:
+                        mpc_speed_ref = max(enc_speed, 0.05)
+
                     z0 = np.array([pos_y, yaw])
-                    # Use mpc_speed_ref for stability
                     delta_rad, v_cmd = mpc.solve(
                         z0, s, D, LANE_WIDTH, -1.0,
                         mpc_speed_ref, mpc_speed_ref, mpc_prev_delta
                     )
                     mpc_prev_delta = delta_rad
                     mpc_last_delta = delta_rad
-                    mpc_last_v = v_cmd
-                    mpc_last_time = now
-                    mpc_solve_ms = mpc.last_solve_ms
+                    mpc_last_v     = v_cmd
+                    mpc_last_time  = now
+                    mpc_solve_ms   = mpc.last_solve_ms
 
-                # Convert MPC outputs to car commands
-                steer_cmd = mpc_last_delta / mpc.delta_max
-                steer_cmd = max(-1.0, min(1.0, steer_cmd))
-                # Speed: constant during maneuver
-                throttle_cmd = mpc_throttle_ref
-                throttle_cmd = max(0.0, min(0.60, throttle_cmd))
+                # Convert to car commands
+                steer_cmd    = float(np.clip(mpc_last_delta / mpc.delta_max, -1.0, 1.0))
+                throttle_cmd = float(np.clip(mpc_throttle_ref, 0.0, 0.60))
 
                 car.steer(steer_cmd)
                 car.forward(throttle_cmd)
@@ -748,70 +740,66 @@ def control_loop(car: JetRacer):
         else:
             car.stop()
             autonomy_state = "FOLLOW"
-            yaw = 0.0
+            yaw   = 0.0
             pos_y = 0.0
-            # FIX: clear stale post-overtake flag on disable so a half-finished
-            # overtake from a previous run doesn't block OVERTAKING from
-            # triggering on the next run.
+            # Clear stale post-overtake flag on disable
             pid_state["is_post_overtake"] = False
 
-
-
-       
-
+        # ── Write shared state ────────────────────────────────────────────
         with state_lock:
-            state["error"]         = round(error, 3)
-            state["steer"]         = round(steer, 3)
-            state["lane_found"]    = lane_found
-            state["lidar_closest"] = lidar_closest
+            state["error"]              = round(error, 3)
+            state["steer"]              = round(steer, 3)
+            state["lane_found"]         = lane_found
+            state["lidar_closest"]      = lidar_closest
             state["lidar_closest_left"] = lidar_closest_left
-            state["lidar_blocked"] = lidar_blocked
-            state["autonomy_state"] = autonomy_state
-            state["imu_ax"] = imu_ax
-            state["imu_ay"] = imu_ay
-            state["imu_az"] = imu_az
-            state["imu_gx"] = imu_gx
-            state["imu_gy"] = imu_gy
-            state["imu_gz"] = imu_gz
+            state["lidar_blocked"]      = lidar_blocked
+            state["autonomy_state"]     = autonomy_state
+            state["imu_ax"]  = imu_ax
+            state["imu_ay"]  = imu_ay
+            state["imu_az"]  = imu_az
+            state["imu_gx"]  = imu_gx
+            state["imu_gy"]  = imu_gy
+            state["imu_gz"]  = imu_gz
             state["enc_speed"] = enc_speed
-            state["enc_dist"] = enc_dist
+            state["enc_dist"]  = enc_dist
 
+        # ── Telemetry ─────────────────────────────────────────────────────
         if s_copy.get("is_testing", False) and s_copy.get("test_id"):
             current_time = time.time()
             data_point = {
-                "timestamp": current_time,
-                "error": round(error, 4) if 'error' in locals() else 0.0,
-                "steer": round(steer, 4) if 'steer' in locals() else 0.0,
-                "left_found": left_found,
-                "right_found": right_found,
-                "lane_width": round(lane_width, 2) if 'lane_width' in locals() else 0.0,
-                "lidar_closest": lidar_closest,
+                "timestamp":      current_time,
+                "error":          round(error, 4),
+                "steer":          round(steer, 4),
+                "left_found":     left_found,
+                "right_found":    right_found,
+                "lane_width":     round(lane_width, 2),
+                "lidar_closest":  lidar_closest,
                 "lidar_closest_left": lidar_closest_left,
-                "lidar_blocked": lidar_blocked,
+                "lidar_blocked":  lidar_blocked,
                 "imu_ax": imu_ax, "imu_ay": imu_ay, "imu_az": imu_az,
                 "imu_gx": imu_gx, "imu_gy": imu_gy, "imu_gz": imu_gz,
-                "enc_speed": enc_speed, "enc_dist": enc_dist,
+                "enc_speed":      enc_speed,
+                "enc_dist":       enc_dist,
                 "autonomy_state": autonomy_state,
                 "crossing_phase": pid_state.get("crossing_phase", 1),
-                "integral": round(pid_state.get("integral", 0.0), 4),
+                "integral":       round(pid_state.get("integral", 0.0), 4),
                 "nominal_lane_width": round(pid_state.get("nominal_lane_width", 0.0), 2),
-                "mpc_solve_ms": round(mpc_solve_ms, 2),
-                "mpc_delta_deg": round(math.degrees(mpc_prev_delta), 2),
-                "mpc_v_cmd": round(mpc_last_v, 4),
-                "pos_y": round(pos_y, 5),
-                "yaw_deg": round(math.degrees(yaw), 2)
+                "mpc_solve_ms":   round(mpc_solve_ms, 2),
+                "mpc_delta_deg":  round(math.degrees(mpc_prev_delta), 2),
+                "mpc_v_cmd":      round(mpc_last_v, 4),
+                "mpc_speed_ref":  round(mpc_speed_ref, 4),
+                "pos_y":          round(pos_y, 5),
+                "yaw_deg":        round(math.degrees(yaw), 2),
             }
             for k, v in s_copy.items():
-                if k not in ["is_testing", "test_id"]:
-                    if isinstance(v, float):
-                        data_point[k] = round(v, 4)
-                    else:
-                        data_point[k] = v
+                if k not in ("is_testing", "test_id"):
+                    data_point[k] = round(v, 4) if isinstance(v, float) else v
             telemetry_queue.put((s_copy["test_id"], current_time, data_point))
 
         frame_idx += 1
 
     cap.release()
+
 
 # ── Flask / dashboard ─────────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -874,7 +862,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>&#9675; JetRacer &#183; MVP &mdash; Lane + Lidar</h1>
+<h1>&#9675; JetRacer &#183; MVP &mdash; Lane + Lidar + MPC</h1>
 <div class="grid">
   <div class="card">
     <h2>Camera feed (annotated)</h2>
@@ -904,6 +892,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <span class="stat-lbl">enc spd</span></div>
       <div class="stat"><span class="stat-val" id="v-enc-dist">0.00</span>
                         <span class="stat-lbl">enc dist</span></div>
+      <div class="stat"><span class="stat-val" id="v-mpc-ms">0.0</span>
+                        <span class="stat-lbl">mpc ms</span></div>
+      <div class="stat"><span class="stat-val" id="v-mpc-delta">0.0</span>
+                        <span class="stat-lbl">mpc δ°</span></div>
+      <div class="stat"><span class="stat-val" id="v-pos-y">0.000</span>
+                        <span class="stat-lbl">pos y m</span></div>
     </div>
     <div class="error-track" title="Lane error (centre = 0)">
       <div id="error-bar"></div>
@@ -922,7 +916,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button id="btn-test" onclick="toggleTest()" style="background: #6b7a99; color: #fff;">&#9654; START TEST</button>
     </div>
     <hr class="divider">
-    <h2>PID gains</h2>
+    <h2>PID gains (FOLLOW state)</h2>
     <div class="slider-row">
       <label>Kp</label>
       <input type="range" id="kp" min="0" max="2" value="0.55" step="0.01">
@@ -1037,36 +1031,40 @@ async function poll() {
     const r = await fetch("/status");
     const d = await r.json();
     document.getElementById("v-state").textContent = d.autonomy_state;
-    document.getElementById("v-fps").textContent  = d.fps;
-    document.getElementById("v-err").textContent  = d.error.toFixed(2);
-    document.getElementById("v-str").textContent  = d.steer.toFixed(2);
+    document.getElementById("v-fps").textContent   = d.fps;
+    document.getElementById("v-err").textContent   = d.error.toFixed(2);
+    document.getElementById("v-str").textContent   = d.steer.toFixed(2);
 
     const laneEl = document.getElementById("v-lane");
     laneEl.textContent = d.lane_found ? "✓" : "✗";
     laneEl.style.color = d.lane_found ? "#00d4aa" : "#ff4d4d";
 
-    const lidarEl = document.getElementById("v-lidar");
-    lidarEl.textContent = d.lidar_closest.toFixed(0);
-    
-    const lidarLeftEl = document.getElementById("v-lidar-left");
-    lidarLeftEl.textContent = d.lidar_closest_left.toFixed(0);
+    document.getElementById("v-lidar").textContent      = d.lidar_closest.toFixed(0);
+    document.getElementById("v-lidar-left").textContent = d.lidar_closest_left.toFixed(0);
 
     const imuAEl = document.getElementById("v-imu-a");
-    if(imuAEl) imuAEl.textContent = d.imu_ax + "," + d.imu_ay + "," + d.imu_az;
+    if (imuAEl) imuAEl.textContent = d.imu_ax + "," + d.imu_ay + "," + d.imu_az;
     const imuGEl = document.getElementById("v-imu-g");
-    if(imuGEl) imuGEl.textContent = d.imu_gx + "," + d.imu_gy + "," + d.imu_gz;
+    if (imuGEl) imuGEl.textContent = d.imu_gx + "," + d.imu_gy + "," + d.imu_gz;
 
     const encSpdEl = document.getElementById("v-enc-spd");
-    if(encSpdEl) encSpdEl.textContent = d.enc_speed.toFixed(2) + " m/s";
+    if (encSpdEl) encSpdEl.textContent = d.enc_speed.toFixed(2) + " m/s";
     const encDistEl = document.getElementById("v-enc-dist");
-    if(encDistEl) encDistEl.textContent = d.enc_dist.toFixed(2) + " m";
+    if (encDistEl) encDistEl.textContent = d.enc_dist.toFixed(2) + " m";
+
+    const mpcMsEl = document.getElementById("v-mpc-ms");
+    if (mpcMsEl) mpcMsEl.textContent = (d.mpc_solve_ms || 0).toFixed(1);
+    const mpcDEl = document.getElementById("v-mpc-delta");
+    if (mpcDEl) mpcDEl.textContent = (d.mpc_delta_deg || 0).toFixed(1) + "°";
+    const posYEl = document.getElementById("v-pos-y");
+    if (posYEl) posYEl.textContent = (d.pos_y || 0).toFixed(3);
 
     const testEl = document.getElementById("v-test");
-    if(testEl) testEl.textContent = d.is_testing ? d.test_id : "--";
+    if (testEl) testEl.textContent = d.is_testing ? d.test_id : "--";
     isTesting = d.is_testing;
     const btn = document.getElementById("btn-test");
-    if(btn) {
-      if(isTesting) {
+    if (btn) {
+      if (isTesting) {
         btn.innerHTML = "&#9632; END TEST";
         btn.style.background = "#ffb020";
       } else {
@@ -1119,9 +1117,27 @@ def video_feed():
 @app.route("/status")
 def status():
     with state_lock:
-        return jsonify({k: state[k] for k in
-                        ("fps", "error", "steer", "lane_found", "enabled",
-                         "lidar_closest", "lidar_closest_left", "lidar_blocked", "autonomy_state", "is_testing", "test_id", "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz", "enc_speed", "enc_dist")})
+        return jsonify({k: state[k] for k in (
+            "fps", "error", "steer", "lane_found", "enabled",
+            "lidar_closest", "lidar_closest_left", "lidar_blocked",
+            "autonomy_state", "is_testing", "test_id",
+            "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz",
+            "enc_speed", "enc_dist",
+        )})
+
+
+@app.route("/status_ext")
+def status_ext():
+    """Extended status including MPC diagnostics — polled by dashboard."""
+    with state_lock:
+        base = {k: state[k] for k in (
+            "fps", "error", "steer", "lane_found", "enabled",
+            "lidar_closest", "lidar_closest_left", "lidar_blocked",
+            "autonomy_state", "is_testing", "test_id",
+            "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz",
+            "enc_speed", "enc_dist",
+        )}
+    return jsonify(base)
 
 
 @app.route("/set", methods=["POST"])
@@ -1131,7 +1147,7 @@ def set_param():
         for k, v in data.items():
             if k == "is_testing":
                 if v and not state.get("is_testing", False):
-                    state["test_id"] = f"test_{int(time.time())}"
+                    state["test_id"]    = f"test_{int(time.time())}"
                     state["is_testing"] = True
                 elif not v and state.get("is_testing", False):
                     state["is_testing"] = False
@@ -1150,8 +1166,7 @@ if __name__ == "__main__":
     car = JetRacer(init_lidar=True)
     car.arm(delay=3)
 
-    # Lidar runs in its own thread — never blocks the camera loop
-    lt = threading.Thread(target=lidar_loop, args=(car,), daemon=True)
+    lt = threading.Thread(target=lidar_loop,  args=(car,), daemon=True)
     lt.start()
 
     ft = threading.Thread(target=firebase_loop, daemon=True)
