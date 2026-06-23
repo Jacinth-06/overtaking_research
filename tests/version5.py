@@ -544,10 +544,10 @@ def control_loop(car: JetRacer):
 
     # ── Maneuver constants ────────────────────────────────────────────────
     LANE_WIDTH_ACTUAL = 0.28
-    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.5   # meters to shift laterally
+    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.4  # meters to shift laterally
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
     OVERTAKE_MANEUVER_DIST = 0.70  # meters of forward travel to complete lane change
-    MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 1.25
+    MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 2.5
     RECOVERY_POS_TOLERANCE = 0.03  # meters
 
     # ── MPC controller (replaces PID trajectory controller) ──────────────
