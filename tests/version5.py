@@ -698,8 +698,8 @@ def control_loop(car: JetRacer):
                 # Convert MPC outputs to car commands
                 steer_cmd = mpc_last_delta / mpc.delta_max
                 steer_cmd = max(-1.0, min(1.0, steer_cmd))
-                # Speed: scale throttle proportionally to MPC speed command
-                throttle_cmd = mpc_throttle_ref * (mpc_last_v / mpc_speed_ref)
+                # Speed: constant during maneuver
+                throttle_cmd = mpc_throttle_ref
                 throttle_cmd = max(0.0, min(0.60, throttle_cmd))
 
                 car.steer(steer_cmd)
@@ -737,7 +737,8 @@ def control_loop(car: JetRacer):
                 # Convert MPC outputs to car commands
                 steer_cmd = mpc_last_delta / mpc.delta_max
                 steer_cmd = max(-1.0, min(1.0, steer_cmd))
-                throttle_cmd = mpc_throttle_ref * (mpc_last_v / mpc_speed_ref)
+                # Speed: constant during maneuver
+                throttle_cmd = mpc_throttle_ref
                 throttle_cmd = max(0.0, min(0.60, throttle_cmd))
 
                 car.steer(steer_cmd)

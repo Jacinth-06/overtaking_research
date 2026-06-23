@@ -103,9 +103,8 @@ class LaneChangeMPC:
         # Dimensions
         self.nx = 2        # [y, θ]
         self.n_delta = M
-        self.n_v = M
         self.n_slack = 1
-        self.n_vars = M + M + 1   # total decision variables
+        self.n_vars = M + 1   # total decision variables
 
         # ── Pre-build differencing matrix T for Δδ ────────────────────────
         #    Δδ₀ = δ₀ − δ_prev   (δ_prev enters via t₀ vector)
@@ -281,11 +280,6 @@ class LaneChangeMPC:
         H_dd = H_dd_lat + H_dd_rate                    # (M × M)
         f_d = f_d_lat + f_d_rate                       # (M,)
 
-        # ── 3. Speed tracking: ‖v − v_ref‖²_rv ──────────────────────────
-        v_ref_vec = v_ref * np.ones(M)
-        H_vv = self.r_v * np.eye(M)                    # (M × M)
-        f_v = -self.r_v * v_ref_vec                    # (M,)
-
         # ── Assemble full H, f ────────────────────────────────────────────
         H = np.zeros((n, n))
         f = np.zeros(n)
@@ -293,21 +287,15 @@ class LaneChangeMPC:
         H[:M, :M] = 2.0 * H_dd
         f[:M] = 2.0 * f_d
 
-        H[M:2*M, M:2*M] = 2.0 * H_vv
-        f[M:2*M] = 2.0 * f_v
-
-        H[2*M, 2*M] = 2.0 * self.rho      # slack penalty
-        # f[2*M] = 0  already
+        H[M, M] = 2.0 * self.rho      # slack penalty
 
         # ── Bounds (hard input constraints) ───────────────────────────────
         lb = np.empty(n)
         ub = np.empty(n)
         lb[:M] = -self.delta_max            # δ lower
         ub[:M] = self.delta_max             # δ upper
-        lb[M:2*M] = self.v_min              # v lower
-        ub[M:2*M] = self.v_max              # v upper
-        lb[2*M] = 0.0                       # ε ≥ 0
-        ub[2*M] = 1e6                       # ε unbounded above
+        lb[M] = 0.0                       # ε ≥ 0
+        ub[M] = 1e6                       # ε unbounded above
 
         # ── Soft output constraints  ──────────────────────────────────────
         #    y_min − ε ≤ ŷ_k ≤ y_max + ε
@@ -331,18 +319,17 @@ class LaneChangeMPC:
         for k in range(P):
             # upper bound
             A_ineq[k, :M] = Th_y[k, :]
-            A_ineq[k, 2*M] = -1.0          # −ε
+            A_ineq[k, M] = -1.0          # −ε
             b_ineq[k] = y_hi - Y_free[k]
 
             # lower bound
             A_ineq[P + k, :M] = -Th_y[k, :]
-            A_ineq[P + k, 2*M] = -1.0      # −ε
+            A_ineq[P + k, M] = -1.0      # −ε
             b_ineq[P + k] = -y_lo + Y_free[k]
 
         # ── Solve ─────────────────────────────────────────────────────────
         x0 = np.zeros(n)
         x0[:M] = np.clip(u_prev_delta, -self.delta_max, self.delta_max)
-        x0[M:2*M] = np.clip(v_ref, self.v_min, self.v_max)
 
         if HAS_SCIPY:
             x_opt = self._solve_scipy(H, f, lb, ub, A_ineq, b_ineq, x0, self.max_iter)
@@ -351,7 +338,7 @@ class LaneChangeMPC:
 
         # ── Extract first commands ────────────────────────────────────────
         delta_opt = float(np.clip(x_opt[0], -self.delta_max, self.delta_max))
-        v_opt = float(np.clip(x_opt[M], self.v_min, self.v_max))
+        v_opt = v_ref
 
         # ── Diagnostics ──────────────────────────────────────────────────
         self.last_solve_ms = (time.time() - t0) * 1000.0
