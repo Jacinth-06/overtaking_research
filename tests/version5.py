@@ -554,7 +554,7 @@ def control_loop(car: JetRacer):
     mpc = LaneChangeMPC(
         Ts=0.1, P=30, M=10,
         L=0.15, delta_max_deg=25.0,
-        q_y=50.0, r_delta=5.0, r_v=10.0, rho=1000.0,
+        q_y=20.0, r_delta=50.0, r_v=10.0, rho=1000.0,
         v_min=0.05, v_max=0.30, y_margin=0.05,
     )
     mpc_prev_delta = 0.0          # previous steering angle (rad) for rate penalty
