@@ -280,12 +280,12 @@ def process_frame(frame, s, annotate: bool):
         elif len(left_pixels) > 10:
             # ONLY LEFT LANE DETECTED (e.g., sharp left turn)
             left_x = np.mean(left_pixels) + x_start
-            target_x = left_x - 140  # Hardcoded fallback offset
+            target_x = left_x + 140  # Hardcoded fallback offset
             
         elif len(right_pixels) > 10:
             # ONLY RIGHT LANE DETECTED (e.g., sharp right turn)
             right_x = np.mean(right_pixels) + x_start
-            target_x = right_x + 140 # Hardcoded fallback offset
+            target_x = right_x - 140 # Hardcoded fallback offset
             
         else:
             # Failsafe
@@ -544,10 +544,10 @@ def control_loop(car: JetRacer):
 
     # ── Maneuver constants ────────────────────────────────────────────────
     LANE_WIDTH_ACTUAL = 0.28
-    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.4  # meters to shift laterally
+    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.5   # meters to shift laterally
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
     OVERTAKE_MANEUVER_DIST = 0.70  # meters of forward travel to complete lane change
-    MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 2.5
+    MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 1.25
     RECOVERY_POS_TOLERANCE = 0.03  # meters
 
     # ── MPC controller (replaces PID trajectory controller) ──────────────
