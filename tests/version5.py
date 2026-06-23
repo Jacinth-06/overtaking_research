@@ -544,7 +544,7 @@ def control_loop(car: JetRacer):
 
     # ── Maneuver constants ────────────────────────────────────────────────
     LANE_WIDTH_ACTUAL = 0.28
-    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.8   # meters to shift laterally
+    LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.75   # meters to shift laterally
     OVERTAKE_TRIGGER_DIST = 700   # mm — start maneuver at this distance
     OVERTAKE_MANEUVER_DIST = 0.50  # meters of forward travel to complete lane change
     MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 1.25
@@ -647,9 +647,9 @@ def control_loop(car: JetRacer):
                     pid_state["lane_change_dist"] = OVERTAKE_MANEUVER_DIST
                     print(f"[STATE] -> OVERTAKING (MPC). Obstacle at {lidar_closest}mm", flush=True)
                 elif pid_state.get("is_post_overtake", False):
-                    # Arrived here after OVERTAKING — wait 0.4m then check left lidar
+                    # Arrived here after OVERTAKING — wait 0.6m then check left lidar
                     s_follow = enc_dist - pid_state.get("post_overtake_enc_dist", enc_dist)
-                    if s_follow >= 0.4 and lidar_closest_left > 400.0:
+                    if s_follow >= 0.6 and lidar_closest_left > 400.0:
                         print("[STATE] -> RECOVERY (MPC, left lane clear)", flush=True)
                         autonomy_state = "RECOVERY"
                         pid_state["is_post_overtake"] = False
