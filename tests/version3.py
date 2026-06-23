@@ -547,7 +547,7 @@ def control_loop(car: JetRacer):
     # FIX: hard safety cap — if lidar_blocked never clears (sensor glitch, obstacle
     # parked alongside), don't hold the lane-change PID forever. Force exit here.
     # Shared by OVERTAKING and RECOVERY (same physical maneuver length scale).
-    MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 2.5
+    MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 1.25
     # FIX: RECOVERY has no external sensor to gate on like OVERTAKING does
     # (lidar_blocked) — it's a pure dead-reckoned maneuver. Exiting on distance
     # alone let it bail before pos_y had actually caught up to target_y. Instead,
