@@ -69,7 +69,7 @@ class LaneChangeMPC:
     def __init__(
         self,
         Ts: float = 0.05,           # sample time  (20 Hz)
-        P: int = 15,                 # prediction horizon  (25 × 0.05 = 1.25 s)
+        P: int = 20,                 # prediction horizon  (25 × 0.05 = 1.25 s)
         M: int = 5,                  # control horizon  (16 % of P)
         L: float = 0.15,            # wheelbase  (m)
         delta_max_deg: float = 25.0, # max steering angle  (°)
