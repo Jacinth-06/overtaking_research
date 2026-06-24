@@ -74,7 +74,7 @@ class LaneChangeMPC:
         L: float = 0.15,            # wheelbase  (m)
         delta_max_deg: float = 25.0, # max steering angle  (°)
         # ── cost weights ──
-        q_y: float = 50.0,         # lateral tracking
+        q_y: float = 25.0,         # lateral tracking
         r_delta: float = 1.0,       # steering rate  (Δδ penalty)
         r_v: float = 10.0,          # speed deviation penalty
         rho: float = 1000.0,        # soft-constraint penalty
