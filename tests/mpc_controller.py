@@ -69,12 +69,12 @@ class LaneChangeMPC:
     def __init__(
         self,
         Ts: float = 0.05,           # sample time  (20 Hz)
-        P: int = 25,                 # prediction horizon  (25 × 0.05 = 1.25 s)
+        P: int = 20,                 # prediction horizon  (25 × 0.05 = 1.25 s)
         M: int = 5,                  # control horizon  (16 % of P)
         L: float = 0.15,            # wheelbase  (m)
         delta_max_deg: float = 25.0, # max steering angle  (°)
         # ── cost weights ──
-        q_y: float = 200.0,         # lateral tracking
+        q_y: float = 100.0,         # lateral tracking
         r_delta: float = 1.0,       # steering rate  (Δδ penalty)
         r_v: float = 10.0,          # speed deviation penalty
         rho: float = 1000.0,        # soft-constraint penalty
