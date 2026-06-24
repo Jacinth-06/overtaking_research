@@ -364,7 +364,7 @@ def firebase_loop():
             if batch:
                 try:
                     for tid, b_data in batch.items():
-                        url = f"{FIREBASE_URL}/Horizon Selection/{tid}.json"
+                        url = f"{FIREBASE_URL}/Tune Q/{tid}.json"
                         requests.patch(url, json=b_data, timeout=5)
                     batch.clear()
                 except Exception as e:
