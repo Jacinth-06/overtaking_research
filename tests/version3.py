@@ -357,7 +357,7 @@ def firebase_loop():
             if batch:
                 try:
                     for tid, b_data in batch.items():
-                        url = f"{FIREBASE_URL}/pid+quintic/{tid}.json"
+                        url = f"{FIREBASE_URL}/follow/{tid}.json"
                         requests.patch(url, json=b_data, timeout=5)
                     batch.clear()
                 except Exception as e:
