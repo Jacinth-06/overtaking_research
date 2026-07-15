@@ -51,7 +51,7 @@ MJPEG_INTERVAL  = 1 / 15
 # ── Maneuver constants ───────────────────────────────────────────────────────
 SWITCH_TRIGGER_DIST = 0.5     # meters — follow for this long before switching
 LANE_WIDTH_ACTUAL = 0.28
-LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.7   # lateral shift in meters
+LANE_WIDTH = LANE_WIDTH_ACTUAL * 0.6  # lateral shift in meters
 OVERTAKE_MANEUVER_DIST = 0.70          # forward distance for MPC maneuver
 MANEUVER_MAX_DIST = OVERTAKE_MANEUVER_DIST * 1.25
 RECOVERY_POS_TOLERANCE = 0.03
