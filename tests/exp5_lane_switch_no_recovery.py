@@ -677,11 +677,11 @@ const commonOptions = {
 
 const chartY = new Chart(document.getElementById('chartY'), {
   type: 'line', data: { labels: [], datasets: [{ label: 'Pos Y (m)', borderColor: '#3b82f6', data: [] }]},
-  options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min: -0.1, max: 0.4 } } }
+  options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min: -0.2, max: 0.2 } } }
 });
 const chartYaw = new Chart(document.getElementById('chartYaw'), {
   type: 'line', data: { labels: [], datasets: [{ label: 'Yaw (deg)', borderColor: '#f59e0b', data: [] }]},
-  options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min: -40, max: 40 } } }
+  options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min: -25, max: 25 } } }
 });
 const chartSteer = new Chart(document.getElementById('chartSteer'), {
   type: 'line', data: { labels: [], datasets: [{ label: 'Steer Command', borderColor: '#ef4444', data: [] }]},
@@ -689,7 +689,7 @@ const chartSteer = new Chart(document.getElementById('chartSteer'), {
 });
 const chartSpeed = new Chart(document.getElementById('chartSpeed'), {
   type: 'line', data: { labels: [], datasets: [{ label: 'Enc Speed (m/s)', borderColor: '#10b981', data: [] }]},
-  options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min: 0, max: 1.5 } } }
+  options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min: 0, max: 0.8 } } }
 });
 
 let isTesting = false;

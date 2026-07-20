@@ -334,7 +334,7 @@ const commonOptions = {
 const chartSpeed = new Chart(document.getElementById('chartSpeed'), {
   type: 'line',
   data: { labels: [], datasets: [{ label: 'Encoder Speed (m/s)', borderColor: '#10b981', data: [] }] },
-  options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min: -0.5, max: 1.5 } } }
+  options: { ...commonOptions, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, min: -0.2, max: 0.8 } } }
 });
 
 const chartLidar = new Chart(document.getElementById('chartLidar'), {
