@@ -84,6 +84,7 @@ state_lock = threading.Lock()
 
 data_log = []
 data_lock = threading.Lock()
+telemetry_queue = queue.Queue()
 
 def telemetry_loop():
     print("[telemetry] Local data logging thread started")
