@@ -28,6 +28,7 @@ state = {
     "enabled": False,
     "stop_distance": 400.0,   # mm
     "lidar_closest": 0.0,
+    "lidar_closest_left": 0.0,
     "lidar_blocked": False,
     "enc_speed": 0.0, "enc_dist": 0.0,
     "imu_ax": 0, "imu_ay": 0, "imu_az": 0,
@@ -46,7 +47,7 @@ _imu_cache_lock = threading.Lock()
 _encoder_cache = {"speed": 0.0, "distance": 0.0}
 _encoder_cache_lock = threading.Lock()
 
-_lidar_cache = {"closest": 0.0, "blocked": False}
+_lidar_cache = {"closest": 0.0, "closest_left": 0.0, "blocked": False}
 _lidar_cache_lock = threading.Lock()
 
 # ── Data Logging ──────────────────────────────────────────────────────────────
@@ -66,9 +67,12 @@ def telemetry_loop():
                 "timestamp": round(time.time(), 3),
                 "speed_cmd": s_copy["speed"],
                 "lidar_closest": s_copy["lidar_closest"],
+                "lidar_closest_left": s_copy["lidar_closest_left"],
                 "lidar_blocked": 1 if s_copy["lidar_blocked"] else 0,
                 "enc_speed": enc_copy["speed"],
                 "enc_dist": enc_copy["distance"],
+                "imu_ax": s_copy["imu_ax"], "imu_ay": s_copy["imu_ay"], "imu_az": s_copy["imu_az"],
+                "imu_gx": s_copy["imu_gx"], "imu_gy": s_copy["imu_gy"], "imu_gz": s_copy["imu_gz"],
             }
             with data_lock:
                 data_log.append(dp)
@@ -87,18 +91,23 @@ def lidar_loop(car: JetRacer):
             scan = car.lidar_scan(samples=150)
             front_distances = [dist for ang, dist in scan.items()
                                if (ang >= 320 or ang <= 40) and dist > 10]
+            left_distances = [dist for ang, dist in scan.items()
+                              if (250 <= ang <= 310) and dist > 10]
 
             closest_front = min(front_distances) if front_distances else 0.0
+            closest_left = min(left_distances) if left_distances else 0.0
             is_blocked = closest_front > 0 and closest_front < STOP_DISTANCE
 
             with _lidar_cache_lock:
                 _lidar_cache["closest"] = round(closest_front, 1)
+                _lidar_cache["closest_left"] = round(closest_left, 1)
                 _lidar_cache["blocked"] = is_blocked
 
         except Exception as e:
             print(f"[lidar] scan error: {e}")
             with _lidar_cache_lock:
                 _lidar_cache["closest"] = 0.0
+                _lidar_cache["closest_left"] = 0.0
                 _lidar_cache["blocked"] = True
 
         time.sleep(0.05)
@@ -140,6 +149,18 @@ def sensor_loop():
             frame = bytes([HEAD1, HEAD2, frame_size]) + rest
             if (sum(frame[:-1]) & 0xFF) != frame[-1]: continue
 
+            # Parse IMU
+            gx = int.from_bytes(frame[4:6],   'big', signed=True) / 32768 * 2000
+            gy = int.from_bytes(frame[6:8],   'big', signed=True) / 32768 * 2000
+            gz = int.from_bytes(frame[8:10],  'big', signed=True) / 32768 * 2000
+            ax = int.from_bytes(frame[10:12], 'big', signed=True) / 32768 * 2 * 9.8
+            ay = int.from_bytes(frame[12:14], 'big', signed=True) / 32768 * 2 * 9.8
+            az = int.from_bytes(frame[14:16], 'big', signed=True) / 32768 * 2 * 9.8
+
+            with _imu_cache_lock:
+                _imu_cache["ax"] = round(ax, 2); _imu_cache["ay"] = round(ay, 2); _imu_cache["az"] = round(az, 2)
+                _imu_cache["gx"] = round(gx, 1); _imu_cache["gy"] = round(gy, 1); _imu_cache["gz"] = round(gz, 1)
+
             # Parse Encoder
             lvel = int.from_bytes(frame[34:36], 'big', signed=True)
             rvel = int.from_bytes(frame[36:38], 'big', signed=True)
@@ -166,7 +187,10 @@ def control_loop(car: JetRacer):
             s_copy = dict(state)
         with _lidar_cache_lock:
             lidar_closest = _lidar_cache["closest"]
+            lidar_closest_left = _lidar_cache.get("closest_left", 0.0)
             lidar_blocked = _lidar_cache["blocked"]
+        with _imu_cache_lock:
+            imu_data = dict(_imu_cache)
         with _encoder_cache_lock:
             enc_speed = _encoder_cache["speed"]
             enc_dist = _encoder_cache["distance"]
@@ -182,9 +206,12 @@ def control_loop(car: JetRacer):
 
         with state_lock:
             state["lidar_closest"] = lidar_closest
+            state["lidar_closest_left"] = lidar_closest_left
             state["lidar_blocked"] = lidar_blocked
             state["enc_speed"] = enc_speed
             state["enc_dist"] = enc_dist
+            state["imu_ax"] = imu_data["ax"]; state["imu_ay"] = imu_data["ay"]; state["imu_az"] = imu_data["az"]
+            state["imu_gx"] = imu_data["gx"]; state["imu_gy"] = imu_data["gy"]; state["imu_gz"] = imu_data["gz"]
 
         time.sleep(0.05)
 
@@ -289,8 +316,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="stat-value" id="disp-lidar">0 mm</div>
       </div>
       <div class="stat-box">
+        <div class="stat-label">LiDAR Left</div>
+        <div class="stat-value" id="disp-lidar-left">0 mm</div>
+      </div>
+      <div class="stat-box">
         <div class="stat-label">Encoder Speed</div>
         <div class="stat-value" id="disp-spd">0.00 m/s</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">IMU Accel</div>
+        <div class="stat-value" id="disp-imu-a">0,0,0</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">IMU Gyro</div>
+        <div class="stat-value" id="disp-imu-g">0,0,0</div>
       </div>
     </div>
 
@@ -364,6 +403,11 @@ async function poll() {
     
     document.getElementById("disp-spd").textContent = d.enc_speed.toFixed(3) + " m/s";
     document.getElementById("disp-lidar").textContent = d.lidar_closest.toFixed(0) + " mm";
+    document.getElementById("disp-lidar-left").textContent = d.lidar_closest_left.toFixed(0) + " mm";
+    const imuAEl = document.getElementById("disp-imu-a");
+    if(imuAEl) imuAEl.textContent = d.imu_ax + "," + d.imu_ay + "," + d.imu_az;
+    const imuGEl = document.getElementById("disp-imu-g");
+    if(imuGEl) imuGEl.textContent = d.imu_gx + "," + d.imu_gy + "," + d.imu_gz;
     
     const blockedEl = document.getElementById("disp-blocked");
     if(d.lidar_blocked) {
@@ -409,8 +453,10 @@ def index():
 def status():
     with state_lock:
         return jsonify({k: state[k] for k in
-                        ("speed", "enabled", "stop_distance", "lidar_closest", "lidar_blocked",
-                         "enc_speed", "enc_dist", "is_testing", "test_id")})
+                        ("speed", "enabled", "stop_distance", "lidar_closest", "lidar_closest_left", "lidar_blocked",
+                         "enc_speed", "enc_dist",
+                         "imu_ax", "imu_ay", "imu_az", "imu_gx", "imu_gy", "imu_gz",
+                         "is_testing", "test_id")})
 
 
 @app.route("/set", methods=["POST"])
