@@ -1,0 +1,6 @@
+jetson-inference/
+jetracer/models/*.caffemodel
+jetson-inference/
+__pycache__/
+*.pyc
+SSD-Mobilenet-v2.tar.gz
